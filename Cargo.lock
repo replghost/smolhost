@@ -1793,31 +1793,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "polkadot-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-net",
- "clap",
- "env_logger",
- "futures-rustls",
- "futures-util",
- "listenfd",
- "log",
- "pin-project",
- "rustix",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "smoldot",
- "smoldot-light",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
- "webpki-roots",
-]
-
-[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2413,6 +2388,31 @@ dependencies = [
  "smoldot",
  "strum",
  "zeroize",
+]
+
+[[package]]
+name = "smolhost"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-net",
+ "clap",
+ "env_logger",
+ "futures-rustls",
+ "futures-util",
+ "listenfd",
+ "log",
+ "pin-project",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smoldot",
+ "smoldot-light",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "webpki-roots",
 ]
 
 [[package]]

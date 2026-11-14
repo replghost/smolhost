@@ -1,9 +1,10 @@
-# polkadot-host
+# Smolhost
 
-A shared Polkadot light-client service for Linux applications.
+A shared Polkadot light-client service for Linux applications, powered by smoldot.
 
 **Experimental, unofficial prototype.** Not security-audited or suitable
-for production funds. Not affiliated with Parity Technologies or the Web3 Foundation.
+for production funds. Independent of the smoldot maintainers, Parity Technologies
+and the Web3 Foundation.
 
 ## What this spike does
 
@@ -91,11 +92,11 @@ location. Source and chain state must not be stored in disposable build outputs.
 Start the daemon in one terminal:
 
 ```sh
-./target/debug/polkadot-hostd --chain-spec chains/paseo.json \
+./target/debug/smolhostd --chain-spec chains/paseo.json \
   --parachain-spec chains/paseo_asset_hub.json
 ```
 
-It creates `$XDG_RUNTIME_DIR/polkadot-host/rpc.sock` and connects to public Paseo
+It creates `$XDG_RUNTIME_DIR/smolhost/rpc.sock` and connects to public Paseo
 peers. Synchronization may take time; readiness of the socket does not mean the
 chain is synchronized. No remote RPC fallback is used.
 
@@ -114,7 +115,7 @@ smoldot's peer authentication, finality verification, or storage-proof checking.
 List configured chains without selecting one:
 
 ```sh
-./target/debug/polkadot-host chains
+./target/debug/smolhost chains
 ```
 
 This prints a single JSON object with the protocol version, read-only policy, and
@@ -124,7 +125,7 @@ and supported read-only RPC methods. It does not wait for chain synchronization.
 In another terminal:
 
 ```sh
-./target/debug/polkadot-host --chain asset-hub-paseo probe --finalizations 3
+./target/debug/smolhost --chain asset-hub-paseo probe --finalizations 3
 ```
 
 Use `--chain paseo` to query the shared relay instead. The corresponding handshake
@@ -143,7 +144,7 @@ session's genesis matches its advertised identity.
 For raw RPC, the CLI streams responses until disconnect, Ctrl-C, or its deadline:
 
 ```sh
-./target/debug/polkadot-host --chain paseo rpc \
+./target/debug/smolhost --chain paseo rpc \
   '{"jsonrpc":"2.0","id":1,"method":"chainHead_v1_follow","params":[false]}'
 ```
 
@@ -158,7 +159,7 @@ path; use `--socket` for an independent experiment.
 
 ## Native application client and discovery
 
-The Rust library exposes `polkadot_host::client::{discover, connect_chain,
+The Rust library exposes `smolhost::client::{discover, connect_chain,
 Connection, RpcClient}`. Applications can use this repository as a Git/path
 dependency; it is not published on crates.io. Pin a reviewed revision. The client
 currently lives in the same package as the daemon and uses its dependency graph.
@@ -168,12 +169,12 @@ genesis rather than trusting a friendly route name:
 
 ```rust
 use anyhow::{Context, Result};
-use polkadot_host::client::{connect_chain, discover};
+use smolhost::client::{connect_chain, discover};
 use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let socket = polkadot_host::default_socket_path()?;
+    let socket = smolhost::default_socket_path()?;
     let host = discover(&socket).await?;
     let expected = "0xd6eec26135305a8ad257a20d003357284c8aa03d0bdb2b357ab0a22371e11ef2";
     let chain = host.chains.iter()
@@ -224,23 +225,23 @@ Requires Linux with a running systemd user manager. No root privileges or sudo:
 
 ```sh
 python3 scripts/user-service.py install
-systemctl --user enable --now polkadot-host.service
-~/.local/bin/polkadot-host --chain asset-hub-paseo probe --finalizations 3
+systemctl --user enable --now smolhost.service
+~/.local/bin/smolhost --chain asset-hub-paseo probe --finalizations 3
 ```
 
 Build both binaries first. The installer defaults to `target/debug`; use
 `--bin-dir /absolute/build/output` for another build. It copies the binaries and
-Paseo and Asset Hub specs into `~/.local/lib/polkadot-host`, links the CLI in `~/.local/bin`, and
+Paseo and Asset Hub specs into `~/.local/lib/smolhost`, links the CLI in `~/.local/bin`, and
 copies the units into `$XDG_CONFIG_HOME/systemd/user` (normally
 `~/.config/systemd/user`). Nothing runs from disposable build outputs.
 
 Installation alone **does not start or enable anything**. The explicit
 `enable --now` command starts the daemon and enables both units for future user
-sessions. For this session only, use `systemctl --user start polkadot-host.service`.
-For on-demand activation instead, enable only `polkadot-host.socket`; the first
+sessions. For this session only, use `systemctl --user start smolhost.service`.
+For on-demand activation instead, enable only `smolhost.socket`; the first
 connection starts the daemon, which then stays running.
 
-The socket remains `$XDG_RUNTIME_DIR/polkadot-host/rpc.sock`, mode `0600`, in a
+The socket remains `$XDG_RUNTIME_DIR/smolhost/rpc.sock`, mode `0600`, in a
 private `0700` directory. Systemd owns the listener and passes it to the daemon.
 The daemon validates its path, permissions, and ownership and never unlinks an
 inherited endpoint. The socket unit refuses to start over an existing pathname,
@@ -253,20 +254,20 @@ checkpoint when present, then catches up with peers. An active unit or listening
 socket does not establish chain readiness—wait for RPC initialization and real data.
 
 ```sh
-systemctl --user status polkadot-host.service polkadot-host.socket
-journalctl --user -u polkadot-host.service -f
-systemctl --user restart polkadot-host.service
+systemctl --user status smolhost.service smolhost.socket
+journalctl --user -u smolhost.service -f
+systemctl --user restart smolhost.service
 ```
 
 To stop it, stop **both** units; leaving the socket running allows connections to
 reactivate the daemon:
 
 ```sh
-systemctl --user stop polkadot-host.socket polkadot-host.service
+systemctl --user stop smolhost.socket smolhost.service
 ```
 
 To also disable future startup, use `systemctl --user disable --now
-polkadot-host.socket polkadot-host.service`. This keeps the installation.
+smolhost.socket smolhost.service`. This keeps the installation.
 For removal, including stopping and disabling both units:
 
 ```sh
@@ -282,10 +283,30 @@ The service follows the lifetime of your user manager. This installer does not
 enable lingering, change logout policy, or claim operation during device suspend.
 See systemd's [socket activation documentation](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html).
 
+### Upgrading from polkadot-host
+
+This is a clean rename, not a compatibility alias. Before updating an older
+installation, run that revision's `scripts/user-service.py uninstall`; it stops
+and removes the old units/binaries while preserving checkpoints. If already
+updated, use the [previous installer](https://github.com/replghost/smolhost/blob/414b9f8/scripts/user-service.py)
+for that uninstall. Stop any manually launched old daemon as well.
+
+With both daemons stopped, optionally move the entire private state directory
+`$XDG_STATE_HOME/polkadot-host` to `$XDG_STATE_HOME/smolhost` (under
+`~/.local/state` when XDG_STATE_HOME is unset). Move it only when the destination
+does not exist; do not merge, overwrite or remove lock files individually. The
+checkpoint format and chain-spec fingerprints are unchanged.
+
+Then build and install Smolhost using the commands above. Update application
+dependencies/imports to `smolhost`, commands to `smolhost`/`smolhostd`, and any
+explicit socket paths to the new location. Discovery protocol version 1 and
+`/host`, `/rpc/<id>` routes are unchanged. The new installer does not manage an
+old-name installation, and the daemon never silently imports old state.
+
 ## Bootstrap checkpoints
 
 Persistence is on by default, including manual runs. State lives in
-`$XDG_STATE_HOME/polkadot-host` (normally `~/.local/state/polkadot-host`), outside
+`$XDG_STATE_HOME/smolhost` (normally `~/.local/state/smolhost`), outside
 the repository and build outputs. Use `--state-dir /absolute/private/directory`
 to select another location, or `--no-state` to neither read nor write checkpoints.
 These options are mutually exclusive. The user service uses systemd's persistent
@@ -428,6 +449,23 @@ checkpoint. Chain-spec/checkpoint updates need explicit provenance and review.
 
 Verified on x86-64 Linux with Rust 1.98.1 and systemd 261.
 
+The Smolhost rename was verified with the renamed binaries and actual user units:
+
+- Offline build and nine checkpoint tests passed. The lockfile changed only the
+  project's package identity; all dependency entries stayed unchanged.
+- Two live Asset Hub clients shared one relay and one parachain initialization,
+  with verified reads continuing after the first client exited.
+- `smolhost chains` activated `smolhost.service` through `smolhost.socket`.
+  An installed probe read finalized Asset Hub block 15,745,942.
+- The new socket/state paths had private permissions; a restarted daemon restored
+  its checkpoint. Uninstall preserved state and removed the installation.
+
+The test-created checkpoint directory and temporary harness were removed. No
+service was left installed or running. Existing installations must follow the
+upgrade instructions above; no old-name aliases are installed.
+
+Earlier verification:
+
 The live Asset Hub acceptance run passed against public peers:
 
 - Exactly one relay and one parachain initialization, with two simultaneous
@@ -439,7 +477,7 @@ The live Asset Hub acceptance run passed against public peers:
 - Eight client, fourteen IPC and eight engine tests passed, covering cancellation,
   ordered notifications, bounds, discovery errors, route isolation and configuration.
 
-A separate live discovery check exercised `polkadot-host chains`, command-specific
+A separate live discovery check exercised the `chains` command, command-specific
 argument validation, and raw RPC with Ctrl-C shutdown. A separately compiled Rust
 consumer discovered both chains, selected Asset Hub by pinned genesis, connected
 through the public adapter and read its actual name/properties. The temporary
@@ -472,7 +510,7 @@ production security.
 Keep the implementation small: one Rust package, two binaries, and engine, IPC,
 transport, and checkpoint modules. [AGENTS.md](AGENTS.md) contains the short working rules. Questions,
 findings, and contributions are welcome in
-[GitHub issues](https://github.com/replghost/polkadot-host/issues). Explain what
+[GitHub issues](https://github.com/replghost/smolhost/issues). Explain what
 you changed and tested; do not post secrets or sensitive vulnerability details.
 
 The next experiment is actual AArch64/mobile resource and suspend/resume

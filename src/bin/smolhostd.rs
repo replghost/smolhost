@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use polkadot_host::{
+use smolhost::{
     default_socket_path,
     engine::{self, CheckpointClient, Engine},
     ipc::{self, BoundSocket, HostCatalog},
@@ -34,7 +34,7 @@ struct Args {
     /// Require exactly one systemd-provided Unix listener; never bind a replacement.
     #[arg(long)]
     systemd_socket: bool,
-    /// Private persistent checkpoint directory (defaults to XDG_STATE_HOME/polkadot-host).
+    /// Private persistent checkpoint directory (defaults to XDG_STATE_HOME/smolhost).
     #[arg(long, conflicts_with = "no_state")]
     state_dir: Option<PathBuf>,
     /// Run without reading or writing bootstrap state.

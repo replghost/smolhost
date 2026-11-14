@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=Smolhost shared Polkadot light client (Paseo)
+Requires=smolhost.socket
+After=smolhost.socket
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+ExecStart="%h/.local/lib/smolhost/smolhostd" --systemd-socket --socket "%t/smolhost/rpc.sock" --chain-spec "%h/.local/lib/smolhost/paseo.json" --parachain-spec "%h/.local/lib/smolhost/paseo_asset_hub.json" --state-dir "%S/smolhost"
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+StateDirectory=smolhost
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target
+Also=smolhost.socket

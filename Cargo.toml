@@ -1,10 +1,10 @@
 [package]
-name = "polkadot-host"
+name = "smolhost"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/replghost/polkadot-host"
-description = "Experimental shared Polkadot light-client service for Linux"
+repository = "https://github.com/replghost/smolhost"
+description = "Independent shared Polkadot light-client service, powered by smoldot"
 publish = false
 
 [dependencies]

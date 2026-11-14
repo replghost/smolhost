@@ -13,8 +13,8 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parent.parent
-UNITS = ("polkadot-host.service", "polkadot-host.socket")
-FILES = ("polkadot-host", "polkadot-hostd", "paseo.json", "paseo_asset_hub.json", *UNITS)
+UNITS = ("smolhost.service", "smolhost.socket")
+FILES = ("smolhost", "smolhostd", "paseo.json", "paseo_asset_hub.json", *UNITS)
 RECEIPT = "installed-files.json"
 
 
@@ -36,8 +36,8 @@ def layout():
     config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
     if not home.is_absolute() or not config.is_absolute():
         raise RuntimeError("HOME and XDG_CONFIG_HOME must be absolute")
-    bundle = home / ".local/lib/polkadot-host"
-    links = {home / ".local/bin/polkadot-host": bundle / "polkadot-host"}
+    bundle = home / ".local/lib/smolhost"
+    links = {home / ".local/bin/smolhost": bundle / "smolhost"}
     files = {
         name: config / "systemd/user" / name if name in UNITS else bundle / name
         for name in FILES
@@ -54,10 +54,10 @@ def install(bin_dir):
         ["systemctl", "--user", "show", *UNITS, "--property=LoadState", "--value"], text=True
     ).split()
     if states != ["not-found", "not-found"]:
-        raise RuntimeError("a polkadot-host unit is already known to the user manager; refusing to shadow it")
+        raise RuntimeError("a smolhost unit is already known to the user manager; refusing to shadow it")
     sources = {
-        "polkadot-host": bin_dir / "polkadot-host",
-        "polkadot-hostd": bin_dir / "polkadot-hostd",
+        "smolhost": bin_dir / "smolhost",
+        "smolhostd": bin_dir / "smolhostd",
         "paseo.json": REPO / "chains/paseo.json",
         "paseo_asset_hub.json": REPO / "chains/paseo_asset_hub.json",
         **{name: REPO / "systemd" / name for name in UNITS},
@@ -65,7 +65,7 @@ def install(bin_dir):
     for name, source in sources.items():
         if not source.is_file():
             raise RuntimeError(f"missing {source}; build both binaries first")
-        if name in ("polkadot-host", "polkadot-hostd") and not os.access(source, os.X_OK):
+        if name in ("smolhost", "smolhostd") and not os.access(source, os.X_OK):
             raise RuntimeError(f"binary is not executable: {source}")
     bundle.parent.mkdir(parents=True, exist_ok=True)
     bundle.mkdir(mode=0o700)
@@ -80,7 +80,7 @@ def install(bin_dir):
                 created.append(destination)
                 with source.open("rb") as stream:
                     shutil.copyfileobj(stream, output)
-            destination.chmod(0o755 if name in ("polkadot-host", "polkadot-hostd") else 0o644)
+            destination.chmod(0o755 if name in ("smolhost", "smolhostd") else 0o644)
             checksums[name] = digest(destination)
         receipt = bundle / RECEIPT
         with receipt.open("x") as output:
@@ -101,8 +101,8 @@ def install(bin_dir):
         bundle.rmdir()
         raise
     print("Installed; nothing has been started or enabled.")
-    print("Start at login and now: systemctl --user enable --now polkadot-host.service")
-    print("Or start only for this session: systemctl --user start polkadot-host.service")
+    print("Start at login and now: systemctl --user enable --now smolhost.service")
+    print("Or start only for this session: systemctl --user start smolhost.service")
 
 
 def uninstall():
@@ -113,7 +113,7 @@ def uninstall():
     if receipt.is_symlink():
         raise RuntimeError("refusing a symlinked installation receipt")
     checksums = json.loads(receipt.read_text())
-    required = {"polkadot-host", "polkadot-hostd", *UNITS}
+    required = {"smolhost", "smolhostd", *UNITS}
     if (
         not isinstance(checksums, dict)
         or not required.issubset(checksums)

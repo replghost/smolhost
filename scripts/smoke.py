@@ -273,7 +273,7 @@ class Smoke:
         ]
 
     def run(self, socket):
-        command = [str(self.args.bin_dir / "polkadot-hostd"),
+        command = [str(self.args.bin_dir / "smolhostd"),
                    "--chain-spec", str(self.args.chain_spec), "--socket", socket, "--no-state"]
         for path in self.args.parachain_spec:
             command.extend(["--parachain-spec", str(path)])
@@ -281,7 +281,7 @@ class Smoke:
         while not self.ready:
             self.pump()
         for name, finalizations in (("A", 1), ("B", 4)):
-            self.start(name, [str(self.args.bin_dir / "polkadot-host"),
+            self.start(name, [str(self.args.bin_dir / "smolhost"),
                               "--socket", socket, "--chain", self.args.chain,
                               "probe", "--finalizations", str(finalizations),
                               "--timeout-secs", str(self.args.timeout_secs)])
@@ -377,7 +377,7 @@ class Smoke:
         for path in (str(self.args.chain_spec), *(str(path) for path in self.args.parachain_spec),
                      str(self.args.bin_dir), str(Path.home())):
             text = text.replace(path, "<local-path>")
-        return re.sub(r"/tmp/polkadot-host-smoke-[^/\s]+", "<temporary-directory>", text)
+        return re.sub(r"/tmp/smolhost-smoke-[^/\s]+", "<temporary-directory>", text)
 
 
 def positive_integer(value):
@@ -410,13 +410,13 @@ def main():
 
     previous_terminate = signal.signal(signal.SIGTERM, interrupted)
     try:
-        for binary in ("polkadot-hostd", "polkadot-host"):
+        for binary in ("smolhostd", "smolhost"):
             path = args.bin_dir / binary
             if not path.is_file() or not os.access(path, os.X_OK):
                 raise SmokeFailure("required already-built executable unavailable: " + binary)
         smoke.configure_chains()
         # A fixed system temporary root avoids excessively long Unix socket paths.
-        temporary = tempfile.TemporaryDirectory(prefix="polkadot-host-smoke-", dir="/tmp")
+        temporary = tempfile.TemporaryDirectory(prefix="smolhost-smoke-", dir="/tmp")
         os.chmod(temporary.name, 0o700)
         smoke.run(str(Path(temporary.name) / "rpc.sock"))
     except SmokeFailure as error:

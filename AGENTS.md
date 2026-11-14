@@ -1,4 +1,4 @@
-# Working on polkadot-host
+# Working on Smolhost
 
 Read [README.md](README.md) for scope and current status. This is a small,
 experimental side project; keep the code and process simple.

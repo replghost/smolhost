@@ -35,12 +35,12 @@ pub fn default_state_dir() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_STATE_HOME") {
         let path = PathBuf::from(path);
         if path.is_absolute() {
-            return Ok(path.join("polkadot-host"));
+            return Ok(path.join("smolhost"));
         }
     }
     let home = PathBuf::from(env::var_os("HOME").context("HOME is not set")?);
     ensure!(home.is_absolute(), "HOME must be nonempty and absolute");
-    Ok(home.join(".local/state/polkadot-host"))
+    Ok(home.join(".local/state/smolhost"))
 }
 
 /// Owns a per-specification process lock until dropped. Lock files are never unlinked.
