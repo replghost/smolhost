@@ -6,8 +6,8 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use polkadot_host::{
     default_socket_path,
-    engine::{CheckpointClient, Engine},
-    ipc::{self, BoundSocket},
+    engine::{self, CheckpointClient, Engine},
+    ipc::{self, BoundSocket, HostCatalog},
     state::{StateStore, default_state_dir},
 };
 use tokio::{
@@ -107,6 +107,7 @@ async fn run(args: Args, inherited: Option<std::os::unix::net::UnixListener>) ->
     )?;
     // The engine consumes the bootstrap data while adding the anchor.
     drop(database);
+    let catalog = Arc::new(HostCatalog::new(&engine::catalog(&engine, &chains).await?)?);
     let checkpoint_worker = match (store, control) {
         (Some(store), Some(control)) => {
             let (shutdown, receiver) = oneshot::channel();
@@ -138,9 +139,10 @@ async fn run(args: Args, inherited: Option<std::os::unix::net::UnixListener>) ->
                 };
                 let engine = engine.clone();
                 let chains = chains.clone();
+                let catalog = Arc::clone(&catalog);
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = ipc::serve(stream, &chains, engine).await {
+                    if let Err(error) = ipc::serve(stream, &chains, engine, catalog).await {
                         log::warn!("host: session ended: {error:#}");
                     }
                 });

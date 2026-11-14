@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
 
+pub mod client;
+pub mod discovery;
 pub mod engine;
 pub mod ipc;
 mod platform;

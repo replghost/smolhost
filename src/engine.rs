@@ -4,14 +4,19 @@ use std::{
     collections::{BTreeMap, HashSet},
     num::NonZeroU32,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use serde_json::value::RawValue;
+use serde_json::{Value, json, value::RawValue};
 use smoldot_light::{AddChainConfig, AddChainConfigJsonRpc, ChainId, Client, JsonRpcResponses};
 
-use crate::platform::Platform;
+use crate::{
+    discovery::{ChainInfo, HostInfo, PROTOCOL_VERSION},
+    ipc::{MAX_RESPONSE_BYTES, allowed_method},
+    platform::Platform,
+};
 pub type SharedEngine = Arc<Mutex<Engine>>;
 
 pub struct Engine {
@@ -107,6 +112,96 @@ impl Engine {
         }
         Ok((engine, chains, checkpoint))
     }
+}
+
+/// Read immutable identity through private startup frontends, never application RPC.
+/// Every frontend is removed before returning, including on error or cancellation.
+pub async fn catalog(engine: &SharedEngine, chains: &[String]) -> Result<HostInfo> {
+    let mut entries = Vec::with_capacity(chains.len());
+    for chain in chains {
+        let (relay_chain, para_id) = {
+            let locked = engine.lock().expect("engine lock poisoned");
+            let configured = locked.chains.get(chain).context("unknown chain route")?;
+            // This metadata has already passed validate_specifications.
+            let metadata: ParachainMetadata<'_> = serde_json::from_str(&configured.specification)?;
+            (
+                metadata
+                    .relay_chain
+                    .map(|raw| serde_json::from_str(raw.get()))
+                    .transpose()?,
+                metadata
+                    .para_id
+                    .map(|raw| serde_json::from_str(raw.get()))
+                    .transpose()?,
+            )
+        };
+        let mut session = Session::open_inner(Arc::clone(engine), chain, false)?;
+        let name =
+            serde_json::from_value(startup_query(&mut session, "chainSpec_v1_chainName").await?)?;
+        let genesis_hash: String =
+            serde_json::from_value(startup_query(&mut session, "chainSpec_v1_genesisHash").await?)?;
+        ensure!(
+            genesis_hash.len() == 66
+                && genesis_hash.starts_with("0x")
+                && genesis_hash[2..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "invalid genesis hash from engine"
+        );
+        let properties = startup_query(&mut session, "chainSpec_v1_properties").await?;
+        let mut methods = startup_query(&mut session, "rpc_methods").await?;
+        let mut rpc_methods: Vec<String> = serde_json::from_value(
+            methods
+                .get_mut("methods")
+                .context("engine omitted supported methods")?
+                .take(),
+        )?;
+        rpc_methods.retain(|method| allowed_method(method));
+        drop(session);
+        entries.push(ChainInfo {
+            id: chain.clone(),
+            name,
+            genesis_hash,
+            relay_chain,
+            para_id,
+            properties,
+            rpc_methods,
+        });
+    }
+    Ok(HostInfo {
+        protocol_version: PROTOCOL_VERSION,
+        read_only: true,
+        chains: entries,
+    })
+}
+
+async fn startup_query(session: &mut Session, method: &str) -> Result<Value> {
+    // Requests are sequential on a private frontend; no subscriptions or retries.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        session.request(json!({"jsonrpc":"2.0","id":1,"method":method,"params":[]}).to_string())?;
+        let response = session
+            .responses
+            .next()
+            .await
+            .context("startup RPC stream closed")?;
+        ensure!(
+            response.len() <= MAX_RESPONSE_BYTES,
+            "startup RPC response exceeds limit"
+        );
+        let mut response: Value = serde_json::from_str(&response)?;
+        ensure!(
+            response.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                && response.get("id") == Some(&json!(1))
+                && response.get("error").is_none(),
+            "invalid startup RPC response for {method}"
+        );
+        response
+            .as_object_mut()
+            .and_then(|response| response.remove("result"))
+            .context("startup RPC response omitted result")
+    })
+    .await
+    .with_context(|| format!("startup RPC {method} exceeded five seconds"))?
 }
 
 #[derive(Deserialize)]
@@ -322,11 +417,16 @@ fn validate_snapshot(database: String, block_number_bytes: usize) -> Result<Snap
 pub struct Session {
     engine: SharedEngine,
     chain_id: ChainId,
+    application: bool,
     pub responses: JsonRpcResponses<Platform>,
 }
 
 impl Session {
     pub fn open(engine: SharedEngine, chain: &str) -> Result<Self> {
+        Self::open_inner(engine, chain, true)
+    }
+
+    fn open_inner(engine: SharedEngine, chain: &str, application: bool) -> Result<Self> {
         let mut locked = engine.lock().expect("engine lock poisoned");
         let Engine {
             client,
@@ -340,21 +440,30 @@ impl Session {
                 &configured.specification,
                 "",
                 AddChainConfigJsonRpc::Enabled {
-                    max_pending_requests: NonZeroU32::new(32).unwrap(),
-                    max_subscriptions: 8,
+                    max_pending_requests: NonZeroU32::new(if application { 32 } else { 1 })
+                        .unwrap(),
+                    max_subscriptions: if application { 8 } else { 0 },
                 },
                 configured.relay_anchor,
             ))
             .map_err(|error| anyhow::anyhow!("adding session: {error}"))?;
-        *active_sessions += 1;
-        log::info!("host: session opened active={active_sessions} chain={chain}");
+        let responses = match added.json_rpc_responses {
+            Some(responses) => responses,
+            None => {
+                let () = client.remove_chain(added.chain_id);
+                anyhow::bail!("missing RPC response stream");
+            }
+        };
+        if application {
+            *active_sessions += 1;
+            log::info!("host: session opened active={active_sessions} chain={chain}");
+        }
         drop(locked);
         Ok(Self {
             engine,
             chain_id: added.chain_id,
-            responses: added
-                .json_rpc_responses
-                .context("missing RPC response stream")?,
+            application,
+            responses,
         })
     }
 
@@ -372,8 +481,10 @@ impl Drop for Session {
     fn drop(&mut self) {
         let mut engine = self.engine.lock().expect("engine lock poisoned");
         let () = engine.client.remove_chain(self.chain_id);
-        engine.active_sessions -= 1;
-        log::info!("host: session closed active={}", engine.active_sessions);
+        if self.application {
+            engine.active_sessions -= 1;
+            log::info!("host: session closed active={}", engine.active_sessions);
+        }
     }
 }
 

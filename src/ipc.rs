@@ -4,12 +4,13 @@ use std::{
     fs, io,
     os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_tungstenite::{
     accept_hdr_async_with_config,
@@ -20,11 +21,37 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::engine::{Session, SharedEngine};
+use crate::{
+    discovery::{DISCOVERY_METHOD, DISCOVERY_PATH, HostInfo},
+    engine::{Session, SharedEngine},
+};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Immutable discovery result, serialized once before accepting applications.
+pub struct HostCatalog {
+    result: Box<RawValue>,
+}
+
+impl HostCatalog {
+    pub fn new(info: &HostInfo) -> Result<Self> {
+        let result = serde_json::value::to_raw_value(info)?;
+        // Reserve space for any request ID permitted by the incoming limit.
+        ensure!(
+            result.get().len() + MAX_REQUEST_BYTES + 64 <= MAX_RESPONSE_BYTES,
+            "host catalog exceeds transport limit"
+        );
+        Ok(Self { result })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    Host,
+    Chain(usize),
+}
 
 pub struct BoundSocket {
     pub listener: UnixListener,
@@ -104,7 +131,12 @@ impl Drop for BoundSocket {
     }
 }
 
-pub async fn serve(stream: UnixStream, chains: &[String], engine: SharedEngine) -> Result<()> {
+pub async fn serve(
+    stream: UnixStream,
+    chains: &[String],
+    engine: SharedEngine,
+    catalog: Arc<HostCatalog>,
+) -> Result<()> {
     ensure!(
         stream.peer_cred()?.uid() == rustix::process::geteuid().as_raw(),
         "peer UID mismatch"
@@ -112,7 +144,7 @@ pub async fn serve(stream: UnixStream, chains: &[String], engine: SharedEngine) 
     let mut selected = None;
     let callback =
         |request: &Request, response: Response| -> std::result::Result<Response, ErrorResponse> {
-            selected = Some(select_chain(request, chains)?);
+            selected = Some(select_route(request, chains)?);
             Ok(response)
         };
     let config = WebSocketConfig::default()
@@ -124,8 +156,11 @@ pub async fn serve(stream: UnixStream, chains: &[String], engine: SharedEngine) 
     )
     .await
     .context("WebSocket handshake timed out")??;
-    let index = selected.context("WebSocket handshake did not select a chain")?;
-    let mut session = Session::open(engine, &chains[index])?;
+    let route = selected.context("WebSocket handshake did not select a route")?;
+    let mut session = match route {
+        Route::Host => None,
+        Route::Chain(index) => Some(Session::open(engine, &chains[index])?),
+    };
     loop {
         let outgoing = tokio::select! {
             message = socket.next() => {
@@ -133,10 +168,17 @@ pub async fn serve(stream: UnixStream, chains: &[String], engine: SharedEngine) 
                     None | Some(Ok(Message::Close(_))) => return Ok(()),
                     Some(Err(error)) => return Err(error.into()),
                     Some(Ok(Message::Text(text))) => {
-                        match validate_request(&text) {
-                            Ok(()) => { session.request(text.to_string())?; continue; }
-                            Err(Some(error)) => Message::Text(error.to_string().into()),
-                            Err(None) => continue,
+                        if let Some(session) = &session {
+                            match validate_request(&text) {
+                                Ok(()) => { session.request(text.to_string())?; continue; }
+                                Err(Some(error)) => Message::Text(error.to_string().into()),
+                                Err(None) => continue,
+                            }
+                        } else {
+                            match host_response(&text, &catalog) {
+                                Some(response) => Message::Text(response.into()),
+                                None => continue,
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(data))) => Message::Pong(data),
@@ -144,12 +186,21 @@ pub async fn serve(stream: UnixStream, chains: &[String], engine: SharedEngine) 
                     Some(Ok(_)) => bail!("only JSON text messages are accepted"),
                 }
             }
-            response = session.responses.next() => {
+            response = async {
+                match &mut session {
+                    Some(session) => session.responses.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 let response = response.context("engine response stream closed")?;
                 ensure!(response.len() <= MAX_RESPONSE_BYTES, "RPC response exceeds transport limit");
                 Message::Text(filter_methods(response).into())
             }
         };
+        ensure!(
+            outgoing.len() <= MAX_RESPONSE_BYTES,
+            "RPC response exceeds transport limit"
+        );
         // No unbounded forwarding queue. A blocked writer loses its session, not events.
         tokio::time::timeout(IO_TIMEOUT, socket.send(outgoing))
             .await
@@ -157,19 +208,24 @@ pub async fn serve(stream: UnixStream, chains: &[String], engine: SharedEngine) 
     }
 }
 
-fn select_chain(request: &Request, chains: &[String]) -> std::result::Result<usize, ErrorResponse> {
-    let selected = request
-        .uri()
-        .path()
-        .strip_prefix("/rpc/")
-        .and_then(|id| chains.iter().position(|chain| chain == id))
-        .filter(|_| request.uri().query().is_none())
-        .ok_or_else(|| {
-            tokio_tungstenite::tungstenite::http::Response::builder()
-                .status(404)
-                .body(Some("unknown chain endpoint".into()))
-                .unwrap()
-        })?;
+fn select_route(request: &Request, chains: &[String]) -> std::result::Result<Route, ErrorResponse> {
+    let selected = if request.uri().path() == DISCOVERY_PATH {
+        Some(Route::Host)
+    } else {
+        request
+            .uri()
+            .path()
+            .strip_prefix("/rpc/")
+            .and_then(|id| chains.iter().position(|chain| chain == id))
+            .map(Route::Chain)
+    }
+    .filter(|_| request.uri().query().is_none())
+    .ok_or_else(|| {
+        tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(404)
+            .body(Some("unknown endpoint".into()))
+            .unwrap()
+    })?;
     if request.headers().contains_key("origin") {
         return Err(tokio_tungstenite::tungstenite::http::Response::builder()
             .status(403)
@@ -179,7 +235,7 @@ fn select_chain(request: &Request, chains: &[String]) -> std::result::Result<usi
     Ok(selected)
 }
 
-fn allowed_method(method: &str) -> bool {
+pub(crate) fn allowed_method(method: &str) -> bool {
     matches!(
         method,
         "rpc_methods"
@@ -198,7 +254,7 @@ fn allowed_method(method: &str) -> bool {
     )
 }
 
-fn validate_request(text: &str) -> std::result::Result<(), Option<Value>> {
+fn parse_request(text: &str) -> std::result::Result<Value, Option<Value>> {
     let request: Value = serde_json::from_str(text)
         .map_err(|_| Some(rpc_error(Value::Null, -32700, "Parse error")))?;
     let id = request.get("id");
@@ -208,6 +264,12 @@ fn validate_request(text: &str) -> std::result::Result<(), Option<Value>> {
     {
         return Err(Some(rpc_error(Value::Null, -32600, "Invalid Request")));
     }
+    Ok(request)
+}
+
+fn validate_request(text: &str) -> std::result::Result<(), Option<Value>> {
+    let request = parse_request(text)?;
+    let id = request.get("id");
     if !allowed_method(request["method"].as_str().unwrap()) {
         return Err(id.map(|id| {
             rpc_error(
@@ -218,6 +280,33 @@ fn validate_request(text: &str) -> std::result::Result<(), Option<Value>> {
         }));
     }
     Ok(())
+}
+
+fn host_response(text: &str, catalog: &HostCatalog) -> Option<String> {
+    let request = match parse_request(text) {
+        Ok(request) => request,
+        Err(error) => return error.map(|error| error.to_string()),
+    };
+    // Valid notifications never receive a response, including method/params errors.
+    let id = request.get("id")?;
+    let method = request["method"].as_str().unwrap();
+    if !matches!(method, "rpc_methods" | DISCOVERY_METHOD) {
+        return Some(rpc_error(id.clone(), -32601, "Method not found").to_string());
+    }
+    if request
+        .get("params")
+        .is_some_and(|params| !params.as_array().is_some_and(Vec::is_empty))
+    {
+        return Some(rpc_error(id.clone(), -32602, "Invalid params").to_string());
+    }
+    let result = if method == DISCOVERY_METHOD {
+        catalog.result.get()
+    } else {
+        r#"{"methods":["rpc_methods","host_discover"]}"#
+    };
+    Some(format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#
+    ))
 }
 
 fn rpc_error(id: Value, code: i32, message: &str) -> Value {
@@ -262,6 +351,183 @@ pub fn read_chain_spec(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn empty_catalog() -> HostCatalog {
+        HostCatalog::new(&HostInfo {
+            protocol_version: crate::discovery::PROTOCOL_VERSION,
+            read_only: true,
+            chains: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn host_route_is_exact_and_rejects_browser_origins_without_chains() {
+        let request = Request::builder().uri("/host").body(()).unwrap();
+        assert_eq!(select_route(&request, &[]).unwrap(), Route::Host);
+        for path in [
+            "/host/",
+            "/Host",
+            "/%68ost",
+            "/host?",
+            "/host?chain=paseo",
+            "/host/../rpc/paseo",
+            "/rpc/host",
+        ] {
+            let request = Request::builder().uri(path).body(()).unwrap();
+            assert_eq!(select_route(&request, &[]).unwrap_err().status(), 404);
+        }
+        for origin in ["https://example.com", "file://", "null", ""] {
+            let request = Request::builder()
+                .uri("/host")
+                .header("Origin", origin)
+                .body(())
+                .unwrap();
+            assert_eq!(select_route(&request, &[]).unwrap_err().status(), 403);
+        }
+    }
+
+    #[test]
+    fn host_errors_preserve_only_valid_request_ids() {
+        let catalog = empty_catalog();
+        for (text, code, id) in [
+            ("{", -32700, Value::Null),
+            ("[]", -32600, Value::Null),
+            (
+                r#"[{"jsonrpc":"2.0","id":7,"method":"host_discover"}]"#,
+                -32600,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"1.0","id":7,"method":"host_discover"}"#,
+                -32600,
+                Value::Null,
+            ),
+            (r#"{"jsonrpc":"2.0","id":7}"#, -32600, Value::Null),
+            (
+                r#"{"jsonrpc":"2.0","id":true,"method":"host_discover"}"#,
+                -32600,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":[],"method":"host_discover"}"#,
+                -32600,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":{},"method":"host_discover"}"#,
+                -32600,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":"client","method":"chainHead_v1_follow"}"#,
+                -32601,
+                json!("client"),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":7,"method":"author_submitExtrinsic"}"#,
+                -32601,
+                json!(7),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":null,"method":"unknown"}"#,
+                -32601,
+                Value::Null,
+            ),
+        ] {
+            let response: Value =
+                serde_json::from_str(&host_response(text, &catalog).unwrap()).unwrap();
+            assert_eq!(response["error"]["code"], code, "{text}");
+            assert_eq!(response["id"], id, "{text}");
+        }
+    }
+
+    #[test]
+    fn host_methods_require_no_arguments_and_keep_chain_gate_separate() {
+        let catalog = empty_catalog();
+        for method in [DISCOVERY_METHOD, "rpc_methods"] {
+            for params in [json!({}), Value::Null, json!([1]), json!(false), json!("")] {
+                let request = json!({"jsonrpc":"2.0","id":"args","method":method,"params":params});
+                let response: Value =
+                    serde_json::from_str(&host_response(&request.to_string(), &catalog).unwrap())
+                        .unwrap();
+                assert_eq!(response["error"]["code"], -32602);
+                assert_eq!(response["id"], "args");
+            }
+            for params in [None, Some(json!([]))] {
+                let mut request = json!({"jsonrpc":"2.0","id":null,"method":method});
+                if let Some(params) = params {
+                    request["params"] = params;
+                }
+                let response: Value =
+                    serde_json::from_str(&host_response(&request.to_string(), &catalog).unwrap())
+                        .unwrap();
+                assert!(response.get("error").is_none());
+                assert!(response["id"].is_null());
+                if method == "rpc_methods" {
+                    assert_eq!(
+                        response["result"]["methods"],
+                        json!(["rpc_methods", DISCOVERY_METHOD])
+                    );
+                } else {
+                    assert_eq!(
+                        response["result"]["protocol_version"],
+                        crate::discovery::PROTOCOL_VERSION
+                    );
+                    assert_eq!(response["result"]["read_only"], true);
+                }
+            }
+        }
+        let error = validate_request(r#"{"jsonrpc":"2.0","id":7,"method":"host_discover"}"#)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(error["error"]["code"], -32601);
+        assert_eq!(error["id"], 7);
+    }
+
+    #[test]
+    fn host_valid_notifications_never_receive_replies() {
+        let catalog = empty_catalog();
+        for method in [
+            DISCOVERY_METHOD,
+            "rpc_methods",
+            "author_submitExtrinsic",
+            "unknown",
+        ] {
+            for params in [None, Some(json!([])), Some(json!([1])), Some(Value::Null)] {
+                let mut request = json!({"jsonrpc":"2.0","method":method});
+                if let Some(params) = params {
+                    request["params"] = params;
+                }
+                assert!(host_response(&request.to_string(), &catalog).is_none());
+            }
+        }
+        // Omitting an ID does not make a malformed request a valid notification.
+        let response: Value = serde_json::from_str(
+            &host_response(r#"{"jsonrpc":"2.0","method":false}"#, &catalog).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(response["id"].is_null());
+    }
+
+    #[test]
+    fn catalog_rejects_oversized_metadata_before_serving() {
+        let info = HostInfo {
+            protocol_version: crate::discovery::PROTOCOL_VERSION,
+            read_only: true,
+            chains: vec![crate::discovery::ChainInfo {
+                id: "large".into(),
+                name: "large".into(),
+                genesis_hash: format!("0x{}", "00".repeat(32)),
+                relay_chain: None,
+                para_id: None,
+                properties: json!({"large": "x".repeat(MAX_RESPONSE_BYTES)}),
+                rpc_methods: Vec::new(),
+            }],
+        };
+        assert!(HostCatalog::new(&info).is_err());
+    }
+
     #[test]
     fn handshake_selects_only_configured_chain_routes() {
         let chains = vec!["paseo".to_owned(), "asset-hub-paseo".to_owned()];
@@ -270,17 +536,20 @@ mod tests {
                 .uri(format!("/rpc/{chain}"))
                 .body(())
                 .unwrap();
-            assert_eq!(select_chain(&request, &chains).unwrap(), index);
+            assert_eq!(
+                select_route(&request, &chains).unwrap(),
+                Route::Chain(index)
+            );
         }
         let request = Request::builder()
             .uri("/rpc/asset-hub-paseo")
             .body(())
             .unwrap();
         assert_eq!(
-            select_chain(&request, &chains[..1]).unwrap_err().status(),
+            select_route(&request, &chains[..1]).unwrap_err().status(),
             404
         );
-        assert_eq!(select_chain(&request, &[]).unwrap_err().status(), 404);
+        assert_eq!(select_route(&request, &[]).unwrap_err().status(), 404);
     }
 
     #[test]
@@ -300,7 +569,7 @@ mod tests {
             "/rpc/asset-hub-paseo?chain=paseo",
         ] {
             let request = Request::builder().uri(path).body(()).unwrap();
-            assert_eq!(select_chain(&request, &chains).unwrap_err().status(), 404);
+            assert_eq!(select_route(&request, &chains).unwrap_err().status(), 404);
         }
     }
 
@@ -314,7 +583,7 @@ mod tests {
                     .header("Origin", origin)
                     .body(())
                     .unwrap();
-                assert_eq!(select_chain(&request, &chains).unwrap_err().status(), 403);
+                assert_eq!(select_route(&request, &chains).unwrap_err().status(), 403);
             }
         }
         let request = Request::builder()
@@ -322,7 +591,7 @@ mod tests {
             .header("Origin", "https://example.com")
             .body(())
             .unwrap();
-        assert_eq!(select_chain(&request, &chains).unwrap_err().status(), 404);
+        assert_eq!(select_route(&request, &chains).unwrap_err().status(), 404);
     }
 
     #[tokio::test]

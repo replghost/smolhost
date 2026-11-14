@@ -16,6 +16,8 @@ for production funds. Not affiliated with Parity Technologies or the Web3 Founda
   No wallet or credentials are needed, and no transactions are submitted.
 - Can run as an opt-in systemd user service, with a supervisor-owned Unix socket.
 - Saves relay bootstrap checkpoints every 60 seconds and on clean shutdown.
+- Discovers configured chains and read-only RPC capabilities over `/host`.
+- Provides a reusable native Rust client; the CLI uses the same adapter.
 
 There is no browser bridge, TCP listener, signing, or Zenoh integration. Desktop
 and mobile are the intended targets; an x86-64 run does not establish AArch64 or
@@ -53,8 +55,9 @@ does not by itself deliver its content-retrieval service.
 
 Beyond chain reads, applications may need:
 
-- Chain/capability discovery, readiness, genesis checking, runtime metadata and
-  a native IPC adapter for their client library.
+- Verified-runtime metadata/typed bindings, app-specific capability checks and
+  synchronization readiness. Configured-chain discovery and native transport are
+  now available below.
 - Wallet-mediated signing and explicit transaction approval/submission. Keys
   should stay outside this read-only daemon.
 - CID-verified blob retrieval and bounded caching for Bulletin; signed-statement
@@ -63,7 +66,8 @@ Beyond chain reads, applications may need:
   history/search that a light client does not provide.
 - Reconnection/resubscription and an idle/suspend policy appropriate for phones.
 
-These are capability boundaries and recommendations, not implemented APIs.
+Beyond discovery and native transport, these are recommendations, not implemented
+host APIs.
 Currently all explicitly configured chains stay active until the daemon stops.
 Per-chain on-demand activation and idle unloading are not implemented; measure
 their resource/battery tradeoffs before expanding the always-running defaults.
@@ -107,6 +111,16 @@ certificate verification enabled. Smoldot's default native platform handles the
 executor, clocks, randomness, and non-TLS connections. TLS does not replace
 smoldot's peer authentication, finality verification, or storage-proof checking.
 
+List configured chains without selecting one:
+
+```sh
+./target/debug/polkadot-host chains
+```
+
+This prints a single JSON object with the protocol version, read-only policy, and
+each chain's route ID, name, genesis hash, relay/parachain relationship, properties
+and supported read-only RPC methods. It does not wait for chain synchronization.
+
 In another terminal:
 
 ```sh
@@ -123,6 +137,8 @@ each subsequent finalized notification, verifies increasing numbers, and release
 obsolete block pins. Its default total deadline is 240 seconds; use
 `--timeout-secs` to change it. Errors, disconnection, or a stopped subscription
 fail the probe rather than being hidden by retries.
+The probe first discovers the selected route, then checks that the connected
+session's genesis matches its advertised identity.
 
 For raw RPC, the CLI streams responses until disconnect, Ctrl-C, or its deadline:
 
@@ -139,6 +155,68 @@ Ctrl-C or SIGTERM; it cancels its sessions and removes its own socket. After an
 unclean manual-run crash, verify that no daemon owns the endpoint before manually
 removing a stale socket. Do not run the service and a manual daemon on the same
 path; use `--socket` for an independent experiment.
+
+## Native application client and discovery
+
+The Rust library exposes `polkadot_host::client::{discover, connect_chain,
+Connection, RpcClient}`. Applications can use this repository as a Git/path
+dependency; it is not published on crates.io. Pin a reviewed revision. The client
+currently lives in the same package as the daemon and uses its dependency graph.
+
+For example, select the bundled classic Paseo Asset Hub by an independently pinned
+genesis rather than trusting a friendly route name:
+
+```rust
+use anyhow::{Context, Result};
+use polkadot_host::client::{connect_chain, discover};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let socket = polkadot_host::default_socket_path()?;
+    let host = discover(&socket).await?;
+    let expected = "0xd6eec26135305a8ad257a20d003357284c8aa03d0bdb2b357ab0a22371e11ef2";
+    let chain = host.chains.iter()
+        .find(|chain| chain.genesis_hash == expected)
+        .context("required Asset Hub genesis is not configured")?;
+    let mut rpc = connect_chain(&socket, chain).await?;
+    let properties = rpc.call("chainSpec_v1_properties", json!([])).await?;
+    println!("{properties}");
+    rpc.close().await?;
+    Ok(())
+}
+```
+
+`RpcClient::call` is sequential; `next_notification` returns notifications in wire
+order, including those received while a call awaited its response. The backlog is
+bounded to 256 envelopes and 8 MiB of original JSON bytes. Overflow fails rather
+than silently discarding events. `Connection` offers raw JSON send/receive for
+applications managing their own request/subscription routing.
+
+Connections verify the daemon's UID and have a five-second connect/handshake
+deadline. Apply your own overall timeout to RPC operations. Cancelling an
+in-flight operation or encountering a transport/protocol error makes the client
+unusable: drop it, reconnect and explicitly resubscribe. A valid remote JSON-RPC
+error does not poison the session. There are no hidden tasks, retries or reconnects.
+Closing sends a close frame but does not wait for peer acknowledgment.
+
+Other native languages can use the same Unix WebSocket protocol. Connect to
+`/host` on the existing socket and send:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"host_discover","params":[]}
+```
+
+The result is protocol version 1 `HostInfo` from `src/discovery.rs`. `/host` also
+supports `rpc_methods`; both methods accept omitted parameters or `[]` only.
+Chain RPC stays on `/rpc/<id>`. Discovery does not open application chain sessions,
+register chains or expose chain specs/checkpoints. The catalog is collected from
+smoldot once during startup and is immutable until restart.
+
+**Configured is not synchronized.** Discovery's method list describes the
+transport API, not runtime pallets, contracts, personhood availability or finalized
+state readiness. Use chain RPC and real verified reads for those checks. Discovery
+is not an independent trust source, a browser bridge or a Product SDK provider.
 
 ## Run as a user service
 
@@ -258,8 +336,8 @@ checkpoint compatibility decision; this version only loads its pinned format.
 
 ## Verify
 
-Offline checks cover chain/parent configuration, route isolation, read-only method
-filtering, socket lifecycle, checkpoint integrity and exclusive writers:
+Offline checks cover client cancellation/notification ordering, discovery routing,
+chain/parent configuration, read-only filtering, socket lifecycle and checkpoints:
 
 ```sh
 cargo test --locked --lib
@@ -308,15 +386,16 @@ See the pinned [upstream implementation](https://docs.rs/crate/smoldot-light/4.0
 
 ## IPC and safety boundaries
 
-- Handshake paths are `/rpc/<configured-chain-id>`; unknown routes are rejected.
-  There is no TCP/HTTP listener for browsers; `file://` pages cannot access it.
+- Handshake paths are `/host` and `/rpc/<configured-chain-id>`; unknown routes are
+  rejected. There is no TCP/HTTP listener for browsers; `file://` pages cannot access it.
 - Private socket directory, socket mode `0600`, and same-effective-UID checks on
   both ends. Browser-origin handshakes and unknown chain paths are rejected.
 - Same-UID processes are not mutually sandboxed. Do not expose this prototype to
   untrusted users or treat it as a security boundary between your own applications.
-- Maximum 16 connections, including pending handshakes; 32 pending RPC requests
-  and 8 subscriptions per session; incoming messages limited to 64 KiB and outgoing
-  messages to 8 MiB. Handshakes and blocked writes have a five-second deadline.
+- Maximum 16 connections, including discovery connections and pending handshakes;
+  32 pending RPC requests and 8 subscriptions per chain session; incoming messages
+  are limited to 64 KiB and outgoing messages to 8 MiB. Handshakes and blocked writes
+  have a five-second deadline.
 - No unbounded host-side forwarding queue. A blocked client loses its connection
   and must resubscribe, rather than silently losing ordered events. These transport
   limits are not a guarantee of a fixed total smoldot/runtime memory footprint.
@@ -354,13 +433,19 @@ The live Asset Hub acceptance run passed against public peers:
 - Exactly one relay and one parachain initialization, with two simultaneous
   application sessions on Asset Hub.
 - Both clients read verified four-byte `System.Number` values and exited
-  successfully. Client A finished at parachain block 15,741,964; client B
-  continued through blocks 15,741,965–15,741,967 after A exited.
+  successfully. Client A finished at parachain block 15,743,206; after A exited,
+  client B returned verified storage at block 15,743,209.
 - Both sessions were released and the temporary daemon stopped.
-- Eight engine and nine IPC tests passed, including invalid parent/ID rejection
-  and configured-route selection.
+- Eight client, fourteen IPC and eight engine tests passed, covering cancellation,
+  ordered notifications, bounds, discovery errors, route isolation and configuration.
 
-The installed two-chain service also passed live checks:
+A separate live discovery check exercised `polkadot-host chains`, command-specific
+argument validation, and raw RPC with Ctrl-C shutdown. A separately compiled Rust
+consumer discovered both chains, selected Asset Hub by pinned genesis, connected
+through the public adapter and read its actual name/properties. The temporary
+consumer source, harness and daemon were removed; no persistent service was installed.
+
+Earlier installed two-chain service checks also passed:
 
 - Simultaneous relay and Asset Hub reads returned distinct genesis hashes, with
   one initialization per chain. An unconfigured route returned HTTP 404.
@@ -390,8 +475,8 @@ findings, and contributions are welcome in
 [GitHub issues](https://github.com/replghost/polkadot-host/issues). Explain what
 you changed and tested; do not post secrets or sensitive vulnerability details.
 
-The next experiments are application-facing discovery/client adapters and actual
-AArch64/mobile validation, not an automatic rollout of every system chain.
+The next experiment is actual AArch64/mobile resource and suspend/resume
+validation, not an automatic rollout of every system chain.
 
 ## License
 
