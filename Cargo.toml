@@ -17,13 +17,13 @@ futures-util = { version = "0.3", features = ["sink"] }
 listenfd = "1"
 log = "0.4"
 pin-project = "1"
-rustix = { version = "1", features = ["process"] }
-serde_json = "1"
+rustix = { version = "1", features = ["process", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
 smoldot = { version = "=6.0.0", default-features = false, features = ["std"] }
 smoldot-light = "=4.0.0"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.28"
 webpki-roots = "1"
-
-[dev-dependencies]
-tempfile = "3"

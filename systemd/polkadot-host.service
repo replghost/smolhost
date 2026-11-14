@@ -8,10 +8,12 @@ StartLimitBurst=3
 
 [Service]
 Type=exec
-ExecStart="%h/.local/lib/polkadot-host/polkadot-hostd" --systemd-socket --socket "%t/polkadot-host/rpc.sock" --chain-spec "%h/.local/lib/polkadot-host/paseo.json"
+ExecStart="%h/.local/lib/polkadot-host/polkadot-hostd" --systemd-socket --socket "%t/polkadot-host/rpc.sock" --chain-spec "%h/.local/lib/polkadot-host/paseo.json" --state-dir "%S/polkadot-host"
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
+StateDirectory=polkadot-host
+StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

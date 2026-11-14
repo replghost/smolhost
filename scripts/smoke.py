@@ -243,7 +243,7 @@ class Smoke:
 
     def run(self, socket):
         self.start("daemon", [str(self.args.bin_dir / "polkadot-hostd"),
-                              "--chain-spec", str(self.args.chain_spec), "--socket", socket])
+                              "--chain-spec", str(self.args.chain_spec), "--socket", socket, "--no-state"])
         while not self.ready:
             self.pump()
         for name, finalizations in (("A", 1), ("B", 4)):

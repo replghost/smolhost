@@ -15,10 +15,10 @@ for production funds. Not affiliated with Parity Technologies or the Web3 Founda
 - Uses a pinned public Paseo relay-chain specification. No wallet or credentials
   are needed, and no transactions are submitted.
 - Can run as an opt-in systemd user service, with a supervisor-owned Unix socket.
+- Saves finalized bootstrap checkpoints every 60 seconds and on clean shutdown.
 
-There is no persisted bootstrap state, parachain support, browser bridge, TCP
-listener, signing, or Zenoh integration. It starts from the chain specification on
-every launch. Desktop and mobile are the intended targets; an x86-64 run does not
+There is no parachain support, browser bridge, TCP listener, signing, or Zenoh
+integration. Desktop and mobile are the intended targets; an x86-64 run does not
 establish AArch64 or phone support.
 
 ## Build
@@ -111,8 +111,8 @@ including a manual daemon's listener; inspect the owner before removing stale fi
 
 The daemon restarts after failure, subject to a three-starts-per-minute limit.
 The socket survives daemon restarts, but **existing application sessions do not**:
-clients must reconnect and resubscribe. Every daemon restart also resynchronizes
-from the bundled spec; persistence is not implemented. An active unit or listening
+clients must reconnect and resubscribe. Startup restores a compatible saved
+checkpoint when present, then catches up with peers. An active unit or listening
 socket does not establish chain readiness—wait for RPC initialization and real data.
 
 ```sh
@@ -145,10 +145,57 @@ The service follows the lifetime of your user manager. This installer does not
 enable lingering, change logout policy, or claim operation during device suspend.
 See systemd's [socket activation documentation](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html).
 
+## Bootstrap checkpoints
+
+Persistence is on by default, including manual runs. State lives in
+`$XDG_STATE_HOME/polkadot-host` (normally `~/.local/state/polkadot-host`), outside
+the repository and build outputs. Use `--state-dir /absolute/private/directory`
+to select another location, or `--no-state` to neither read nor write checkpoints.
+These options are mutually exclusive. The user service uses systemd's persistent
+`StateDirectory` at the same default location.
+
+Each exact chain-spec fingerprint has a JSON checkpoint and a separate lock file.
+Different spec bytes select a different checkpoint; old files are not deleted.
+Only one daemon can own a given specification's state at a time, even when its
+IPC socket differs. Directories must be user-owned `0700`; state files must be
+user-owned `0600`. Symlink and nonregular-file endpoints are rejected.
+
+The daemon requests smoldot's `chainHead_unstable_finalizedDatabase` through a
+**private** anchor RPC frontend, not through the application socket. It validates
+the exported finalized-chain information and writes a versioned envelope with
+the pinned engine version, spec fingerprint, and SHA-256 payload checksum.
+The smoldot payload is limited to 8 MiB. A same-directory temporary file, file
+fsync, atomic rename, and directory fsync prevent in-place partial publication.
+Lock files remain on disk; do not remove them while a daemon is running.
+
+Missing state means a normal cold start. Corrupt, incompatible, oversized, or
+insecure state fails startup without overwriting it. Periodic export/write failures
+are logged and do not stop RPC service; a shutdown-save failure produces a nonzero
+daemon exit. Export requests have a five-second deadline, and shutdown waits at
+most 12 seconds for the checkpoint worker. Unclean termination can lose progress
+since the last completed checkpoint. A failed directory fsync can leave a newly
+published checkpoint whose durability is uncertain.
+
+This is a bootstrap cache, **not** a full chain database: it can include finalized
+chain information, discovered peers, and runtime hints, not historical storage or
+application subscriptions. It originates from locally verified synchronization,
+but smoldot subsequently treats saved finality as a **trusted local checkpoint**.
+Checksums detect corruption, not malicious same-user modification. Never import
+untrusted checkpoint files or publish local state dumps.
+
+Uninstall preserves state. To reset an incompatible or damaged checkpoint, stop
+both service units and preserve/move the affected JSON file before restarting;
+do not delete the lock file. `--no-state` is also available for an isolated
+diagnostic run. There is no silent state reset or remote-RPC fallback.
+
+Smoldot's [database input contract](https://docs.rs/smoldot-light/4.0.0/smoldot_light/struct.AddChainConfig.html#structfield.database_content)
+reserves the right to change its format. Engine upgrades need an explicit
+checkpoint compatibility decision; this version only loads its pinned format.
+
 ## Verify
 
-Offline checks cover read-only method filtering and socket ownership/lifecycle
-boundaries:
+Offline checks cover read-only method filtering, socket ownership/lifecycle,
+checkpoint integrity, atomic replacement, permissions, and exclusive writers:
 
 ```sh
 cargo test --locked --lib
@@ -168,6 +215,7 @@ The script uses its own temporary directory and daemon. It requires:
 3. Both sessions being released without stopping the daemon.
 4. Exactly one smoldot chain initialization across those connections.
 
+The script uses `--no-state`, so it never touches your persistent checkpoints.
 It prints a JSON result and stops its child processes on success, failure, or
 interruption. It does not install anything, change a live service, or submit a
 transaction. Use `--bin-dir` for a custom build output and `--timeout-secs` for a
@@ -244,19 +292,32 @@ All six offline IPC tests passed, including inherited-listener lifetime and
 permission checks. The test installation was removed afterward. Login/reboot,
 suspend/resume, and mobile behavior were not exercised.
 
-This proves the relay-chain scenario, not restart persistence, mobile
-compatibility, or production security.
+Persistence verification subsequently passed against public Paseo peers:
+
+- A periodic checkpoint captured finalized block 1,933,109. After `SIGKILL`,
+  smoldot reported **Database starting at block 1,933,109**, then the probe read
+  verified state at 1,933,110.
+- Clean shutdown saved block 1,933,111; the restarted service resumed there and
+  returned verified state at 1,933,112.
+- Two application sessions still shared one chain initialization. A second
+  checkpoint writer was refused, corrupt state remained untouched, and
+  `--no-state` returned verified state without creating persistent files.
+- All 17 offline tests passed across targeted runs. Temporary service units and
+  test checkpoints were removed.
+
+This does not establish mobile compatibility, reboot/suspend behavior, or
+production security.
 
 ## Development
 
-Keep the implementation small: one Rust package, two binaries, and engine/IPC/
-transport modules. [AGENTS.md](AGENTS.md) contains the short working rules. Questions,
+Keep the implementation small: one Rust package, two binaries, and engine, IPC,
+transport, and checkpoint modules. [AGENTS.md](AGENTS.md) contains the short working rules. Questions,
 findings, and contributions are welcome in
 [GitHub issues](https://github.com/replghost/polkadot-host/issues). Explain what
 you changed and tested; do not post secrets or sensitive vulnerability details.
 
-The next experiments are persisted bootstrap state, a parachain, and actual
-AArch64/mobile validation. None are implied by a successful relay-chain run.
+The next experiments are a parachain and actual AArch64/mobile validation.
+Neither is implied by a successful relay-chain run.
 
 ## License
 

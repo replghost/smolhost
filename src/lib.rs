@@ -7,6 +7,7 @@ use anyhow::{Context, Result, ensure};
 pub mod engine;
 pub mod ipc;
 mod platform;
+pub mod state;
 
 /// Resolve the per-user endpoint without falling back to a shared temporary path.
 pub fn default_socket_path() -> Result<PathBuf> {
