@@ -22,6 +22,39 @@ const MAX_RECEIVE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NOTIFICATIONS: usize = 256;
 type Socket = WebSocketStream<UnixStream>;
 
+pub(crate) fn validate_chain_id(id: &str) -> Result<()> {
+    ensure!(
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)),
+        "chain must be a nonempty URL path component using letters, digits, '-' or '_'"
+    );
+    Ok(())
+}
+
+/// Shared authenticated transport policy for JSON-RPC and content clients.
+pub(crate) async fn connect_socket(path: &Path, url: String, max_receive: usize) -> Result<Socket> {
+    tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let stream = UnixStream::connect(path)
+            .await
+            .with_context(|| format!("connecting to {}", path.display()))?;
+        ensure!(
+            stream.peer_cred()?.uid() == rustix::process::geteuid().as_raw(),
+            "daemon socket belongs to a different user"
+        );
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(max_receive))
+            .max_frame_size(Some(max_receive));
+        let (socket, _) = client_async_with_config(url, stream, Some(config))
+            .await
+            .context("WebSocket handshake over Unix socket")?;
+        Ok(socket)
+    })
+    .await
+    .context("Unix connection and WebSocket handshake exceeded five seconds")?
+}
+
 /// One raw JSON transport. A failed or cancelled I/O operation makes it unusable;
 /// drop it and connect again. There are no application-level request timeouts.
 pub struct Connection {
@@ -33,13 +66,7 @@ impl Connection {
     /// Connect to a configured chain route, checking its safe route ID and peer UID.
     /// This does not verify chain identity; use [`connect_chain`] for that.
     pub async fn chain(path: &Path, id: &str) -> Result<Self> {
-        ensure!(
-            !id.is_empty()
-                && id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)),
-            "chain must be a nonempty URL path component using letters, digits, '-' or '_'"
-        );
+        validate_chain_id(id)?;
         Self::connect(path, format!("ws://localhost/rpc/{id}")).await
     }
 
@@ -49,27 +76,10 @@ impl Connection {
     }
 
     async fn connect(path: &Path, url: String) -> Result<Self> {
-        tokio::time::timeout(CONNECT_TIMEOUT, async {
-            let stream = UnixStream::connect(path)
-                .await
-                .with_context(|| format!("connecting to {}", path.display()))?;
-            ensure!(
-                stream.peer_cred()?.uid() == rustix::process::geteuid().as_raw(),
-                "daemon socket belongs to a different user"
-            );
-            let config = WebSocketConfig::default()
-                .max_message_size(Some(MAX_RECEIVE_BYTES))
-                .max_frame_size(Some(MAX_RECEIVE_BYTES));
-            let (socket, _) = client_async_with_config(url, stream, Some(config))
-                .await
-                .context("WebSocket handshake over Unix socket")?;
-            Ok(Self {
-                socket,
-                usable: true,
-            })
+        Ok(Self {
+            socket: connect_socket(path, url, MAX_RECEIVE_BYTES).await?,
+            usable: true,
         })
-        .await
-        .context("Unix connection and WebSocket handshake exceeded five seconds")?
     }
 
     /// Send one JSON text message, limited to 64 KiB. Cancelling the send may leave

@@ -17,6 +17,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 listenfd = "1"
 log = "0.4"
 pin-project = "1"
+prost = "0.14"
 rustix = { version = "1", features = ["process", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -27,3 +28,13 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.28"
 webpki-roots = "1"
+
+[dev-dependencies]
+blake2 = "0.10"
+bs58 = "0.5"
+frame-metadata = { version = "23", default-features = false, features = ["current", "decode"] }
+hex = "0.4"
+parity-scale-codec = { version = "3", features = ["derive"] }
+scale-info = { version = "2", features = ["derive", "decode"] }
+scale-value = { version = "0.18", default-features = false }
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }

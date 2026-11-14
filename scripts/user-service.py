@@ -14,7 +14,9 @@ import sys
 
 REPO = Path(__file__).resolve().parent.parent
 UNITS = ("smolhost.service", "smolhost.socket")
-FILES = ("smolhost", "smolhostd", "paseo.json", "paseo_asset_hub.json", *UNITS)
+CHAINS = ("paseo.json", "paseo_next_asset_hub.json", "paseo_next_bulletin.json",
+          "paseo_next_individuality.json")
+FILES = ("smolhost", "smolhostd", *CHAINS, *UNITS)
 RECEIPT = "installed-files.json"
 
 
@@ -58,8 +60,7 @@ def install(bin_dir):
     sources = {
         "smolhost": bin_dir / "smolhost",
         "smolhostd": bin_dir / "smolhostd",
-        "paseo.json": REPO / "chains/paseo.json",
-        "paseo_asset_hub.json": REPO / "chains/paseo_asset_hub.json",
+        **{name: REPO / "chains" / name for name in CHAINS},
         **{name: REPO / "systemd" / name for name in UNITS},
     }
     for name, source in sources.items():

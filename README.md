@@ -13,12 +13,18 @@ and the Web3 Foundation.
 - Gives each connection its own RPC session while sharing chain synchronization.
 - Includes a CLI that follows finalized blocks and reads `System.Number` from
   verified chain storage, plus an opt-in two-process acceptance script.
-- Loads pinned public Paseo relay and Asset Hub specifications in one client.
+- Loads pinned Paseo relay and Next v2 Asset Hub, Bulletin and Individuality specs
+  in one client, sharing the relay across all three application chains.
   No wallet or credentials are needed, and no transactions are submitted.
 - Can run as an opt-in systemd user service, with a supervisor-owned Unix socket.
 - Saves relay bootstrap checkpoints every 60 seconds and on clean shutdown.
 - Discovers configured chains and read-only RPC capabilities over `/host`.
 - Provides a reusable native Rust client; the CLI uses the same adapter.
+- Includes a separate native-balance application example using the public client.
+- Streams CID-verified Bulletin files over a separate content route, with a native
+  download client that publishes only complete files without overwriting paths.
+- Provides an opt-in endurance harness for finalized-read stability and Linux
+  process resource measurements.
 
 There is no browser bridge, TCP listener, signing, or Zenoh integration. Desktop
 and mobile are the intended targets; an x86-64 run does not establish AArch64 or
@@ -26,27 +32,28 @@ phone support.
 
 ## Chain defaults and application needs
 
-The installed service currently enables **classic Paseo + Asset Hub Paseo**
-(parachain 1000). It does not enable production chains. The relay is a shared
-security dependency, not a separate light client per application or parachain.
+The installed service enables **Paseo Next v2's application profile**: Asset Hub,
+Bulletin and Individuality/People, with one shared Paseo relay dependency. It does
+not enable production Polkadot chains or mix in Products Devnet. Classic Paseo
+Asset Hub remains an explicit manual/baseline fixture, not the installed default.
 
-For an application-oriented profile, prefer a small capability catalog rather
-than automatically synchronizing every system chain:
+The profile is deliberately smaller than the set of all system chains:
 
 | Role | What applications need it for | Policy |
 | --- | --- | --- |
 | Relay chain | Parachain verification and finality | Shared dependency |
-| Asset Hub | Assets, balances, runtime/contract reads, naming where deployed | Current tested default |
-| Bulletin | Content-addressed files, app bundles, media | Candidate for an app profile; blob retrieval also needs Bitswap/IPFS |
-| Individuality / People deployments | Identity, personhood, statement allowances | Select the exact deployment; do not treat these names as interchangeable |
+| Asset Hub | Assets, balances, runtime/contract reads, naming where deployed | Enabled: `next-asset-hub-paseo`, para 1500 |
+| Bulletin | Content-addressed files, app bundles, media | Enabled RPC and native Bitswap file retrieval: `next-bulletin-paseo`, para 1501 |
+| Individuality / People | Identity, personhood and membership policy | Enabled RPC: `next-people-paseo`, para 1502; not interchangeable with other People deployments |
 | Bridge Hub, Collectives, Coretime | Bridges, collectives/fellowship, coretime operations | Explicitly configure only when an application needs them |
 
 The public [Product SDK chain client](https://docs.polkadot.com/apps/product-sdk/chain-client/)
-uses Asset Hub, Bulletin, and Individuality as its three application-facing roles.
-However, its [network presets](https://docs.polkadot.com/apps/concepts/networks/)
-distinguish Paseo Next v2 from Products Devnet; neither is an alias for this
-classic Asset Hub fixture. Match genesis hashes and runtime/deployment metadata,
-not merely a friendly network name. This daemon is not a Product SDK Host provider.
+uses these three application-facing roles. We pin its **Paseo Next v2** deployment,
+not an environment inferred from friendly names. Its [network presets](https://docs.polkadot.com/apps/concepts/networks/)
+distinguish this from Products Devnet and classic Asset Hub. The compact fixtures'
+computed genesis hashes match independently pinned SDK descriptors; see
+[`chains/paseo-next-v2-provenance.json`](chains/paseo-next-v2-provenance.json).
+This daemon is not a Product SDK Host provider.
 
 [Individuality](https://github.com/paritytech/individuality-community) describes
 itself as experimental People-chain infrastructure, not part of the official
@@ -61,14 +68,14 @@ Beyond chain reads, applications may need:
   now available below.
 - Wallet-mediated signing and explicit transaction approval/submission. Keys
   should stay outside this read-only daemon.
-- CID-verified blob retrieval and bounded caching for Bulletin; signed-statement
-  gossip, allowances and expiry handling for applications using Statement Store.
+- Optional application-owned content caching and Bulletin retention/renewal policy;
+  signed-statement gossip, allowances and expiry handling for Statement Store.
 - Network-specific contract/name-service configuration, and optional indexers for
   history/search that a light client does not provide.
 - Reconnection/resubscription and an idle/suspend policy appropriate for phones.
 
-Beyond discovery and native transport, these are recommendations, not implemented
-host APIs.
+Beyond discovery, native transport and read-only content retrieval, these are
+recommendations, not implemented host APIs.
 Currently all explicitly configured chains stay active until the daemon stops.
 Per-chain on-demand activation and idle unloading are not implemented; measure
 their resource/battery tradeoffs before expanding the always-running defaults.
@@ -93,7 +100,9 @@ Start the daemon in one terminal:
 
 ```sh
 ./target/debug/smolhostd --chain-spec chains/paseo.json \
-  --parachain-spec chains/paseo_asset_hub.json
+  --parachain-spec chains/paseo_next_asset_hub.json \
+  --parachain-spec chains/paseo_next_bulletin.json \
+  --parachain-spec chains/paseo_next_individuality.json
 ```
 
 It creates `$XDG_RUNTIME_DIR/smolhost/rpc.sock` and connects to public Paseo
@@ -125,12 +134,13 @@ and supported read-only RPC methods. It does not wait for chain synchronization.
 In another terminal:
 
 ```sh
-./target/debug/smolhost --chain asset-hub-paseo probe --finalizations 3
+./target/debug/smolhost --chain next-asset-hub-paseo probe --finalizations 3
 ```
 
-Use `--chain paseo` to query the shared relay instead. The corresponding handshake
-paths are `/rpc/asset-hub-paseo` and `/rpc/paseo`. A connection selects one chain
-once; its requests and subscriptions remain isolated from other connections.
+Use `--chain next-bulletin-paseo` or `--chain next-people-paseo` for the other app
+chains, or `--chain paseo` for the shared relay. Handshake paths are
+`/rpc/<chain-id>`. A connection selects one chain once; its requests and
+subscriptions remain isolated from other connections.
 
 The probe prints JSON lines: `initialized`, `storage`, `finalized`, and `completed`.
 It reads a four-byte SCALE `System.Number` at the initial finalized block and after
@@ -164,7 +174,7 @@ Connection, RpcClient}`. Applications can use this repository as a Git/path
 dependency; it is not published on crates.io. Pin a reviewed revision. The client
 currently lives in the same package as the daemon and uses its dependency graph.
 
-For example, select the bundled classic Paseo Asset Hub by an independently pinned
+For example, select the default Paseo Next v2 Asset Hub by an independently pinned
 genesis rather than trusting a friendly route name:
 
 ```rust
@@ -176,7 +186,7 @@ use serde_json::json;
 async fn main() -> Result<()> {
     let socket = smolhost::default_socket_path()?;
     let host = discover(&socket).await?;
-    let expected = "0xd6eec26135305a8ad257a20d003357284c8aa03d0bdb2b357ab0a22371e11ef2";
+    let expected = "0x4349b00e54897e21196fd331015fc5be0f14e118beb0375ed2bb1793737bb57a";
     let chain = host.chains.iter()
         .find(|chain| chain.genesis_hash == expected)
         .context("required Asset Hub genesis is not configured")?;
@@ -219,6 +229,173 @@ transport API, not runtime pallets, contracts, personhood availability or finali
 state readiness. Use chain RPC and real verified reads for those checks. Discovery
 is not an independent trust source, a browser bridge or a Product SDK provider.
 
+## Read the application profile
+
+Build and run a separate application against the default/manual Next v2 profile:
+
+```sh
+cargo build --locked --release --bins --example read-app-profile
+./target/release/examples/read-app-profile
+```
+
+It discovers all three routes by independently pinned genesis hashes, then reads
+each at a verified finalized block using that block's runtime metadata:
+
+| Role | Read | Meaning |
+| --- | --- | --- |
+| Asset Hub | `System.Account` | Exact native balance fields for the public Alice fixture, or your `--address` |
+| Bulletin | `TransactionStorage.RetentionPeriod` | Data-retention policy in blocks, distinguishing stored value from metadata default |
+| Individuality | `Members.OldRootRetentionDuration` | Verified runtime constant: membership-ring old-root grace period in seconds |
+
+Use `--socket` for another private endpoint and `--timeout-secs` for the total
+deadline. JSONL includes genesis, block, runtime-code hash, metadata version,
+source kind and exact integer strings. These are separate finalized snapshots,
+not an atomic cross-chain view. A later chain can fail after earlier records were
+printed: check the process exit status. Missing roles and unsupported schemas fail
+explicitly, without public-RPC fallback.
+
+These reads do not fetch Bulletin blobs, exchange statements, identify people,
+prove a user's personhood, sign or submit transactions.
+
+## Retrieve Bulletin files
+
+The daemon reuses smoldot's native Bitswap service: no IPFS daemon, gateway,
+remote RPC fallback, or persistent content cache. Chain synchronization and peer
+connections are shared with existing sessions. This is read-only: it cannot
+upload, renew, sign, submit transactions, or exchange signed statements.
+
+Build the external consumer, then run it against a daemon with Bulletin configured:
+
+```sh
+cargo build --locked --release --example fetch-blob
+./target/release/examples/fetch-blob \
+  --cid bafybeicms2uw6i5r6z7djjqk2365uh4zlerd6xd4z4iw642huojvtpjzhq \
+  --output ./bulletin-file.bin
+```
+
+The example defaults to `next-bulletin-paseo` and the normal private socket.
+Override `--socket`, `--chain`, `--max-bytes`, or `--timeout-secs` as needed.
+The sample CID is public testnet content, not a permanent availability promise;
+Bulletin retention and peer availability still apply. There are no hidden
+retries. A newly started daemon may need time to connect to Bitswap peers.
+
+Rust applications can call `smolhost::content::client::fetch(socket, chain, cid,
+output, FetchOptions)` and receive a `smolhost::content::Receipt`. The daemon
+verifies each block's CID and the UnixFS file/subtree sizes before completion.
+The client independently checks the streamed byte count and SHA-256 receipt,
+syncs a private `0600` temporary file in the destination directory, then atomically
+publishes without replacing an existing file or symlink. Failure, timeout, or
+Ctrl-C removes the partial file; the daemon never receives the output pathname.
+An abrupt process death (including SIGKILL or an unhandled SIGTERM) can leave a
+private `.smolhost-content-*` partial file, never a completed destination. Cleanup
+on such failures is not automatic. Publication syncs the file, not its parent
+directory; survival of the new directory entry across power loss is not guaranteed.
+
+Supported content is canonical lowercase base32 **CIDv1**, raw blocks (`0x55`)
+and DAG-PB (`0x70`) UnixFS File/Raw nodes, including inline bytes, nested files
+and ordered chunk links. Hashes: SHA2-256, BLAKE2b-256 and Keccak-256. CIDv0,
+other encodings/codecs, directories, symlinks and HAMT nodes are rejected.
+This is a file reader, not a directory extractor or a general IPFS API.
+
+### Content wire protocol
+
+Connect over the existing private Unix socket to `/content/<configured-chain-id>`.
+One connection serves one download. Send a text request:
+
+```json
+{"version":1,"cid":"<CID>","max_bytes":67108864}
+```
+
+`max_bytes` is optional and defaults to 64 MiB; a caller can only lower it.
+Unknown fields and versions are rejected. The server sends:
+
+1. Text `{"event":"started","version":1,"cid":"<CID>","chain":"<chain-id>"}`.
+2. Binary file chunks of at most 64 KiB each.
+3. Text `{"event":"completed","cid":"<CID>","bytes":N,"blocks":N,"sha256":"<lowercase hex>"}`,
+   then closes.
+
+An error sends `{"event":"error","message":"..."}` when the transport permits,
+then closes without completion. Previously received chunks remain partial:
+never publish or execute them. Send `{"event":"cancel"}` or disconnect to cancel,
+including while a block fetch or socket write is pending. The native client
+cancels by dropping its connection. Upstream cancellation is best effort for
+network requests already sent.
+
+Hard bounds: four simultaneous transfers within the existing 16-connection
+budget; one outstanding block fetch per transfer; 64 MiB reconstructed file;
+2 MiB per encoded block; 4096 block occurrences including manifests/repeated
+references; 32 root-inclusive DAG levels; 4 KiB control messages.
+Accepted encoded DAG bytes are limited to `max_bytes + 16 MiB` (at most 80 MiB),
+including repeated blocks and metadata. One additional block of up to 2 MiB can
+be fetched before its size reveals the excess; it is rejected before hashing or
+decoding. This is not a cap on total network protocol overhead.
+The request and each blocked write have five-second deadlines; a transfer has
+a 180-second deadline. Client deadlines may be shorter. These bounds do not
+impose a fixed memory ceiling on smoldot's shared chain/runtime services.
+
+The local daemon is trusted to verify CIDs. Its completion SHA-256 detects
+stream corruption but is not an independent proof of the root CID. A CID proves
+content identity, **not** chain inclusion, authorship, retention, permission to
+execute a bundle, or safety of its contents. The selected chain supplies network
+context; Bitswap availability is not chain-provenance evidence.
+
+The adapter uses the pinned smoldot
+[`bitswap_unstable_stream` implementation](https://github.com/paritytech/smoldot/blob/6aaa2a8e550f208b3d2182b411c99219680121e0/light-base/src/bitswap_service.rs)
+internally; it is not part of the public RPC allowlist. The bounded file walker
+supports the format produced by Bulletin's public
+[UnixFS DAG builder](https://github.com/paritytech/polkadot-bulletin-chain/blob/ec88c0f52ee4a09213cc0cc105390a190cd41568/sdk/rust/src/dag.rs).
+
+## Native balance application
+
+`examples/watch-balance.rs` is a separate application process, not a daemon API
+or a wallet. It discovers the pinned classic Paseo Asset Hub and reads native
+`System.Account` balances at finalized blocks through the same Unix socket.
+It does not watch Assets/ForeignAssets tokens or submit transactions.
+
+Build the example and the daemon:
+
+```sh
+cargo build --locked --release --bins --example watch-balance
+```
+
+This example deliberately retains the **classic** Asset Hub genesis for baseline
+comparisons; it does not target the installed Next v2 profile. Start a separate
+classic manual daemon:
+
+```sh
+./target/release/smolhostd --chain-spec chains/paseo.json \
+  --parachain-spec chains/paseo_asset_hub.json
+```
+
+If the installed service is active, stop both units first or give both daemon and
+example a separate private `--socket` path. In another terminal:
+
+```sh
+./target/release/examples/watch-balance --address YOUR_ACCOUNT --finalizations 3
+```
+
+The example uses verified runtime metadata rather than assuming a fixed SCALE
+account layout. Balance amounts are exact integer base-unit strings, not
+floating-point amounts or an estimate of spendable funds. An absent account is
+reported explicitly; it is not evidence of a failed RPC or of missing history.
+No signing keys, faucet funding or personal account is required to try it.
+
+`--address` accepts checksum-verified SS58 AccountId32 or `0x` followed by exactly
+64 hexadecimal digits. An SS58 network prefix does not select the chain; the
+application's genesis pin does. `--socket` selects another daemon endpoint.
+The example emits an initial balance and then the requested number of additional
+finalized blocks (`--finalizations 0` reads only the initial block). Each JSON
+record includes the account ID, block/genesis hashes, existence, metadata version,
+runtime-code hash and named balance fields.
+
+Metadata V14–V16 is supported only for the validated `System.Account` schema.
+The example verifies the runtime-code hash at every selected block and stops
+explicitly on a runtime upgrade instead of decoding with stale metadata.
+`--timeout-secs` bounds discovery, synchronization and reads; cleanup can take
+up to two additional seconds. Errors and Ctrl-C exit unsuccessfully, without
+automatic reconnect/resubscribe. Treat this as a small fail-closed example, not
+a production payment monitor.
+
 ## Run as a user service
 
 Requires Linux with a running systemd user manager. No root privileges or sudo:
@@ -226,13 +403,13 @@ Requires Linux with a running systemd user manager. No root privileges or sudo:
 ```sh
 python3 scripts/user-service.py install
 systemctl --user enable --now smolhost.service
-~/.local/bin/smolhost --chain asset-hub-paseo probe --finalizations 3
+~/.local/bin/smolhost --chain next-asset-hub-paseo probe --finalizations 3
 ```
 
 Build both binaries first. The installer defaults to `target/debug`; use
-`--bin-dir /absolute/build/output` for another build. It copies the binaries and
-Paseo and Asset Hub specs into `~/.local/lib/smolhost`, links the CLI in `~/.local/bin`, and
-copies the units into `$XDG_CONFIG_HOME/systemd/user` (normally
+`--bin-dir /absolute/build/output` for another build. It copies the binaries,
+Paseo relay and all three Next v2 specs into `~/.local/lib/smolhost`, links the CLI
+in `~/.local/bin`, and copies the units into `$XDG_CONFIG_HOME/systemd/user` (normally
 `~/.config/systemd/user`). Nothing runs from disposable build outputs.
 
 Installation alone **does not start or enable anything**. The explicit
@@ -282,6 +459,16 @@ alone. For this spike, update by uninstalling and then reinstalling.
 The service follows the lifetime of your user manager. This installer does not
 enable lingering, change logout policy, or claim operation during device suspend.
 See systemd's [socket activation documentation](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html).
+
+### Upgrading from the classic two-chain profile
+
+Before updating, uninstall with the old revision's installer. If already updated,
+use the [classic-profile installer at `90533dc`](https://github.com/replghost/smolhost/blob/90533dc/scripts/user-service.py)
+to remove that receipt-owned installation, then install this revision. The new
+installer intentionally does not accept the old file set. Checkpoints are
+preserved; the shared relay specification and checkpoint format are unchanged.
+Update application genesis pins/routes deliberately: Next v2 Asset Hub is a
+different chain, not a route alias for classic Asset Hub.
 
 ### Upgrading from polkadot-host
 
@@ -358,17 +545,28 @@ checkpoint compatibility decision; this version only loads its pinned format.
 ## Verify
 
 Offline checks cover client cancellation/notification ordering, discovery routing,
-chain/parent configuration, read-only filtering, socket lifecycle and checkpoints:
+chain/parent configuration, read-only filtering, socket lifecycle, checkpoints,
+CID/UnixFS integrity and bounds, content cancellation/backpressure and verified
+no-clobber file publication:
 
 ```sh
 cargo test --locked --lib
+```
+
+Focused offline checks for metadata/address decoding and the endurance harness:
+
+```sh
+cargo test --locked --release --example watch-balance --example read-app-profile
+python3 -B -m unittest discover -s scripts -p 'test_soak.py'
 ```
 
 For a live test against public Paseo peers, build both binaries first, then run:
 
 ```sh
 python3 scripts/smoke.py --chain-spec chains/paseo.json \
-  --parachain-spec chains/paseo_asset_hub.json --chain asset-hub-paseo
+  --parachain-spec chains/paseo_next_asset_hub.json \
+  --parachain-spec chains/paseo_next_bulletin.json \
+  --parachain-spec chains/paseo_next_individuality.json --chain next-asset-hub-paseo
 ```
 
 For the relay-only scenario, omit `--parachain-spec` and use `--chain paseo`.
@@ -387,6 +585,111 @@ interruption. It does not install anything, change a live service, or submit a
 transaction. Use `--bin-dir` for a custom build output and `--timeout-secs` for a
 longer overall deadline. Network availability is required; this is not an offline
 unit test.
+
+### Longer-running stability and resource smoke
+
+Build release binaries first; debug-build CPU measurements are not a useful
+production baseline:
+
+```sh
+cargo build --locked --release --bins
+python3 scripts/soak.py --bin-dir target/release \
+  --parachain-spec chains/paseo_next_asset_hub.json \
+  --parachain-spec chains/paseo_next_bulletin.json \
+  --parachain-spec chains/paseo_next_individuality.json \
+  --chain next-asset-hub-paseo \
+  --expected-genesis 0x4349b00e54897e21196fd331015fc5be0f14e118beb0375ed2bb1793737bb57a \
+  --chain next-bulletin-paseo \
+  --expected-genesis 0x8cfe6717dc4becfda2e13c488a1e2061ff2dfee96e7d031157f72d36716c0a22 \
+  --chain next-people-paseo \
+  --expected-genesis 0x4a2b5b737de1da59e209b0000a876ec2fa20035dc34fd292a848da32d255ad48 \
+  --duration-secs 21600 --max-rss-mib 4096 \
+  --output-dir "$HOME/.local/state/smolhost-soak-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+This is an opt-in six-hour experiment, not a service installation. The command
+above starts its own relay plus three-parachain daemon, a private socket and fresh
+private checkpoint state. One continuous client per selected chain reads finalized
+`System.Number`; an additional short-lived client rotates among the chains.
+Stalls, unexpected exits and invalid reads fail rather than being hidden by
+reconnection. Each chain has an independent progress deadline, so one healthy
+chain cannot mask another stalling.
+
+Pair each repeated `--chain` with one `--expected-genesis`, in the same order.
+There are at most seven monitored chains, leaving capacity for discovery and
+churn within the daemon's unchanged connection limit. Without chain/spec overrides
+the harness deliberately retains the classic two-chain baseline. For a short
+comparison use `--duration-secs 180 --sample-secs 5` for both profiles.
+
+The workload duration starts only after **every monitored chain** has a verified
+initial read; startup has its own deadline. Defaults sample every 10 seconds,
+churn a client every 60 seconds, and fail after 240 seconds without advancing
+finalized reads on any monitored chain. `SOAK_READY` is not a completed test.
+
+The output directory must not already exist. Keep it outside disposable build
+outputs and do not publish it wholesale: it contains local logs and trusted
+checkpoint state. Review the machine-readable summary and samples instead.
+The run stops its own children at the deadline or on interruption; it never
+stops an installed Smolhost service. An interrupted run is not a pass.
+Evidence files are `metadata.json`, `samples.jsonl`, `progress.jsonl`, bounded
+role logs and `summary.json`. The summary separates startup, active workload and
+steady measurements (excluding the first 60 workload seconds), plus per-chain
+read counts/finalized progress, checkpoint shutdown and process-exit evidence.
+Missing summary after power loss
+or SIGKILL is not a pass. Use immutable binaries for a run so later rebuilds do
+not change its periodically launched clients.
+
+Measurements cover the daemon process: resident memory (RSS), CPU time, threads
+and open file descriptors. CPU `100%` means one full logical core, not the whole
+machine. Compare cold-start and established-sync periods separately. A rising
+RSS sample series is a signal to investigate, not proof of a leak; stable RSS
+over six hours is not proof that leaks are impossible. The explicit 4 GiB RSS
+cap above is an unattended-run safety limit, not an expected footprint.
+
+This workload measures an active shared light client, not an idle/on-demand host,
+complete application resource use, mobile battery drain or suspend recovery.
+
+### Content retrieval soak
+
+`scripts/content-soak.py` tests the content endpoint independently of the chain-read
+soak. It launches its own no-state daemon with the default application profile,
+waits for a verified finalized Bulletin read, then exercises concurrent download
+pairs, cancellation after real bytes, an actual nonreading WebSocket consumer,
+and successful recovery downloads. It never connects to an existing service.
+
+```sh
+cargo build --locked --release --bins --example fetch-blob
+python3 -B scripts/content-soak.py --bin-dir target/release \
+  --duration-secs 900 \
+  --output-dir "$HOME/.local/state/smolhost-content-soak-$(date -u +%Y%m%dT%H%M%SZ)" \
+  --cid bafybeicms2uw6i5r6z7djjqk2365uh4zlerd6xd4z4iw642huojvtpjzhq \
+  --expected-sha256 91d59231ddad7d2e94c313aa5d9b95cc44b2a4775fdaaf24f6cd3f17f2cf1155 \
+  --expected-bytes 10493449 --expected-blocks 10 \
+  --churn-cid bafkreifmnwlmsa2txujfhujb4sfahvg2a3bsntcbpyni3pywdp4m7khb4m \
+  --churn-sha256 ac6d96c90353bd1253d121e48a03d4da06c326cc417e1a8dbf161bf8cfa8e1e3 \
+  --churn-bytes 3658 --churn-blocks 1
+```
+
+Use current, independently verified public fixtures if those CIDs expire.
+All four `--churn-*` pins are optional together: with them, most churn uses the
+small file and every eighth pair uses the primary chunked file. Without them,
+every pair fetches the large file. Defaults pause 30 seconds between pairs, sample
+every five seconds and exclude the first 120 workload seconds from steady metrics.
+No new pair starts in the final 180 seconds, leaving a quiet observation tail.
+
+Every completed file and receipt must match the independent size, block-count and
+SHA-256 pins. Verified files are then deleted; at most two output files are active.
+There are no retries or silently ignored failures. Nonreader qualification requires
+the daemon's specific content-write-timeout event, not a simulated stalled sink;
+error-frame/close deadlines can extend connection cleanup beyond the first
+five-second write deadline.
+
+Evidence is private: binary/script/spec identities, bounded rotating role/event/
+sample logs, and `summary.json` with failure counters, RSS/HWM/PSS, CPU and a
+warmup-separated memory trend. CPU `100%` is one core. The harness stops and reaps
+only its own children on completion, errors and handled signals. A missing summary
+is not a pass. Do not rebuild its binaries during a run or publish raw evidence.
+Offline harness checks: `python3 -B -m unittest discover -s scripts -p 'test_content_soak.py'`.
 
 ### Why the sharing evidence matters
 
@@ -407,22 +710,24 @@ See the pinned [upstream implementation](https://docs.rs/crate/smoldot-light/4.0
 
 ## IPC and safety boundaries
 
-- Handshake paths are `/host` and `/rpc/<configured-chain-id>`; unknown routes are
-  rejected. There is no TCP/HTTP listener for browsers; `file://` pages cannot access it.
+- Handshake paths are `/host`, `/rpc/<configured-chain-id>` and
+  `/content/<configured-chain-id>`; unknown routes are rejected. There is no
+  TCP/HTTP listener for browsers; `file://` pages cannot access it.
 - Private socket directory, socket mode `0600`, and same-effective-UID checks on
   both ends. Browser-origin handshakes and unknown chain paths are rejected.
 - Same-UID processes are not mutually sandboxed. Do not expose this prototype to
   untrusted users or treat it as a security boundary between your own applications.
 - Maximum 16 connections, including discovery connections and pending handshakes;
-  32 pending RPC requests and 8 subscriptions per chain session; incoming messages
-  are limited to 64 KiB and outgoing messages to 8 MiB. Handshakes and blocked writes
-  have a five-second deadline.
+  32 pending RPC requests and 8 subscriptions per chain session. Incoming frames
+  are limited to 64 KiB and outgoing RPC messages to 8 MiB. Content has the tighter
+  protocol limits above. Handshakes and blocked writes have a five-second deadline.
 - No unbounded host-side forwarding queue. A blocked client loses its connection
   and must resubscribe, rather than silently losing ordered events. These transport
   limits are not a guarantee of a fixed total smoldot/runtime memory footprint.
 - `rpc_methods` advertises only allowed read-only methods: supported `chainSpec_v1_*`
-  and `chainHead_v1_*` operations. Transaction, administrative, and legacy RPCs are
-  unavailable. Batch requests are not supported.
+  and `chainHead_v1_*` operations. Transaction, administrative, legacy and raw
+  Bitswap RPCs are unavailable through `/rpc`; content uses its separate bounded
+  endpoint. Batch requests are not supported.
 - Finalized state is the correctness boundary; best-block state is provisional.
   Complete historical data and full-node API parity are not provided.
 - Never put wallet keys, seed phrases, private endpoints, or user-state dumps in
@@ -442,12 +747,137 @@ See the pinned [upstream implementation](https://docs.rs/crate/smoldot-light/4.0
 - SHA-256: `d50dc59e4d1f48f203542d0de2149928b26a640902ba8bd9351acdf64fed0b27`
 - Route `asset-hub-paseo`, relay `paseo`, parachain ID 1000; same upstream license.
 
+The Next v2 profile adds these unchanged compact specs from the same public
+smoldot revision:
+
+- [`paseo_asset_hub_next.json`](https://github.com/paritytech/smoldot/blob/6aaa2a8e550f208b3d2182b411c99219680121e0/demo-chain-specs/paseo_asset_hub_next.json)
+  → `chains/paseo_next_asset_hub.json`.
+- [`paseo_bulletin_next.json`](https://github.com/paritytech/smoldot/blob/6aaa2a8e550f208b3d2182b411c99219680121e0/demo-chain-specs/paseo_bulletin_next.json)
+  → `chains/paseo_next_bulletin.json`.
+- [`paseo_people_next.json`](https://github.com/paritytech/smoldot/blob/6aaa2a8e550f208b3d2182b411c99219680121e0/demo-chain-specs/paseo_people_next.json)
+  → `chains/paseo_next_individuality.json`.
+
+[`paseo-next-v2-provenance.json`](chains/paseo-next-v2-provenance.json) records
+source SHA-256s, licenses, relay evidence and independently pinned
+[SDK descriptor genesis hashes](https://github.com/paritytech/product-sdk/tree/964e6a3eee628c77bb294c0f7b62b210c841e9eb/product-sdk/packages/descriptors/chains).
+No genesis root or checkpoint was derived from an untrusted public RPC response.
+
 The pin makes this experiment reproducible; it is not an indefinitely fresh trust
 checkpoint. Chain-spec/checkpoint updates need explicit provenance and review.
 
 ## Observed verification
 
 Verified on x86-64 Linux with Rust 1.98.1 and systemd 261.
+
+### Native Bulletin retrieval
+
+On 2026-11-14, an isolated release daemon with the three-chain application profile
+retrieved the sample CID above through native P2P Bitswap. The separate
+`fetch-blob` process saved **10,493,449 bytes** from **10 blocks**: one DAG-PB
+manifest and nine raw chunks. Retrieval took **6.965 seconds** after a finalized
+Bulletin readiness probe; this is one smoke observation, not a throughput benchmark.
+
+The output SHA-256 was
+`91d59231ddad7d2e94c313aa5d9b95cc44b2a4775fdaaf24f6cd3f17f2cf1155`.
+For independent fixture research, a public Bulletin full-node RPC supplied the
+manifest and raw blocks; each CID digest and the ordered reconstruction were
+checked separately with Node's SHA-256 implementation. The daemon/download
+application did not use that RPC or an HTTP gateway.
+
+The live smoke also verified:
+
+- A 1024-byte caller limit rejects the large file without leaving partial output.
+- Invalid CIDs fail and existing output is never overwritten.
+- Ctrl-C after receiving 3658 bytes removes the partial file without publication.
+- A subsequent 3658-byte raw-CID download succeeds; saved files have mode `0600`.
+- The isolated daemon exits zero and removes its socket.
+
+All **45 focused release tests** passed across content, native client and IPC.
+They include hash/size failures, malformed protobuf, nested/repeated chunk ordering,
+bounded traversal, cancellation during blocked writes, completion-marker/digest
+validation and existing-file/symlink protection. The original long-running
+finalized-read soak was not restarted or used for content traffic. This does not
+establish long-term content-transfer stability or mobile performance.
+
+### Content retrieval qualification
+
+A subsequent isolated release run completed on 2026-11-14 after the review added
+an encoded-DAG overhead budget. Its regression rejects repeated metadata-heavy
+empty files without publishing content. All 15 focused DAG tests and 19 offline
+content-harness tests passed; the release binaries/example built successfully.
+
+| Measurement | Observed |
+| --- | --- |
+| Workload after finalized readiness | 900 seconds |
+| Independently verified downloads | 50, in 25 concurrent pairs |
+| Unexpected failures / read errors / timeouts | 0 / 0 / 0 |
+| Partial-stream cancellation | 1, followed by successful recovery |
+| Deliberate nonreader writer timeout | 1, followed by successful recovery |
+| Steady daemon CPU, one core = 100% | 0.74% average |
+| Steady RSS, first to last / peak | 259.9 to 297.5 MiB / 297.5 MiB |
+| Steady PSS, first to last / peak | 256.6 to 294.1 MiB / 294.1 MiB |
+
+The two-minute warmup is excluded from steady metrics. Traffic was intermittent:
+small-file session churn, periodic large-file pairs, and a final three-minute
+quiet tail. RSS rose during the earlier large-file cycles, then changed by less
+than 0.5 MiB across the final six minutes. This does not identify the cause of
+retained memory or prove the absence of leaks under sustained large-file traffic.
+The harness completed cleanup without forced kills or shutdown failures; the
+separate original chain-read soak was untouched. Raw evidence stays outside the
+public repository. This is prototype qualification, not a production memory bound.
+
+### Paseo Next v2 application profile
+
+Verified the actual installer and socket-activated user units with the new default
+profile, using a private checkpoint-directory override. Discovery exposed the
+relay and all three correctly pinned parachains. The separate consumer read:
+
+- Asset Hub's public Alice native account balance.
+- Bulletin's stored retention policy: **201600 blocks**.
+- Individuality's verified membership old-root grace-period constant: **600 seconds**.
+
+The service saved a relay checkpoint and exited zero; the test installation and
+override were removed, while private evidence/state were retained. Eight profile
+example tests and five classic balance example tests passed. The multichain
+harness's 18 focused checks passed after correcting a missing test-fixture setup.
+
+Two fresh 180-second workload runs used identical release daemon/client binaries,
+5-second sampling, 60-second warmup exclusion and 60-second client churn on the
+same i7-10700K desktop. They ran concurrently; the earlier six-hour classic soak
+was left untouched. Both completed, saved checkpoints and stopped cleanly:
+
+| Measurement | Classic relay + Asset Hub | Relay + all three Next v2 app chains |
+| --- | ---: | ---: |
+| Sampled peak daemon RSS (MiB) | 106.7 | 187.4 |
+| Steady average CPU (% of one core) | 0.55 | 0.74 |
+| Verified continuous storage reads | 94 | 227 |
+| Peak file descriptors | 33 | 40 |
+
+All three app chains advanced independently: 96 Asset Hub, 32 Bulletin and 96
+Individuality finalized notifications. These short runs are not long-term
+stability, mobile/battery qualification or a memory ceiling. The profiles also
+use different Asset Hub runtimes; the delta is not a per-chain memory budget.
+
+### Earlier verification
+
+The balance application and endurance harness were verified with release builds:
+
+- Five metadata/address decoding tests and sixteen resource/progress harness
+  tests passed.
+- Two independent balance consumers read a present public test account and an
+  absent account across successive finalized Asset Hub blocks using verified V14
+  metadata. Absent balances were explicitly zero; malformed addresses failed.
+- A 180-second active-workload smoke completed 97 continuous verified reads and
+  96 advancing finalizations, plus two successful short-lived clients. The
+  daemon saved its checkpoint and exited zero; the continuous probe was
+  intentionally terminated at the test deadline.
+- On an Intel i7-10700K desktop, that short run observed roughly 114 MiB peak
+  daemon RSS and 0.70% steady average CPU (100% is one core). The final RSS
+  sample was roughly 65 MiB. These are short, workload-specific observations,
+  not a memory ceiling or evidence of long-term leak freedom.
+
+Longer runs must be judged from their completed `summary.json`, not an initial
+`SOAK_READY` marker. Evidence/checkpoints remain private and outside build outputs.
 
 The Smolhost rename was verified with the renamed binaries and actual user units:
 

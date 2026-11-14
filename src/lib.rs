@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 
 pub mod client;
+pub mod content;
 pub mod discovery;
 pub mod engine;
 pub mod ipc;

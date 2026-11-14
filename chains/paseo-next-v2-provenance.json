@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "network": "Paseo Next v2",
+  "scope": "Public compact chain specifications only; not classic Paseo Asset Hub or Products Devnet.",
+  "inventory_research": [
+    {
+      "repository": "https://github.com/paseo-network/paseo-chain-specs",
+      "default_branch": "main",
+      "revision": "0f3b655048bdd03e5dc8caaab4711667bc9a089c",
+      "tree_url": "https://api.github.com/repos/paseo-network/paseo-chain-specs/git/trees/0f3b655048bdd03e5dc8caaab4711667bc9a089c?recursive=1",
+      "result": "Inventory contains the substitute Paseo relay and classic system-chain specs, but no Next specs. No Next fixture was taken from this repository.",
+      "license": "No LICENSE file present in the inspected repository tree."
+    },
+    {
+      "repository": "https://github.com/paritytech/smoldot",
+      "default_branch": "main",
+      "revision": "6aaa2a8e550f208b3d2182b411c99219680121e0",
+      "tree_url": "https://api.github.com/repos/paritytech/smoldot/git/trees/6aaa2a8e550f208b3d2182b411c99219680121e0?recursive=1",
+      "result": "demo-chain-specs contains compact Next Asset Hub, Bulletin and People specs."
+    }
+  ],
+  "spec_source": {
+    "repository": "https://github.com/paritytech/smoldot",
+    "revision": "6aaa2a8e550f208b3d2182b411c99219680121e0",
+    "license": "GPL-3.0-or-later WITH Classpath-exception-2.0",
+    "license_url": "https://raw.githubusercontent.com/paritytech/smoldot/6aaa2a8e550f208b3d2182b411c99219680121e0/LICENSE",
+    "license_sha256": "aab56b4a581fc1c50b7c782eacf2fc8be05a47cd98e4bf4d836dd9b6dd9c86f4",
+    "transform": "Copy the upstream UTF-8 JSON bytes unchanged to the local filename. Preserve upstream names, IDs, bootnodes, para IDs, relay IDs and genesis state roots. No RPC-derived checkpoint, runtime blob or lightSyncState was added.",
+    "retrieval_command_template": "gh api 'repos/paritytech/smoldot/contents/{source_path}?ref=6aaa2a8e550f208b3d2182b411c99219680121e0' -H 'Accept: application/vnd.github.raw+json'"
+  },
+  "independent_genesis_source": {
+    "repository": "https://github.com/paritytech/product-sdk",
+    "revision": "964e6a3eee628c77bb294c0f7b62b210c841e9eb",
+    "license": "Apache-2.0",
+    "license_url": "https://raw.githubusercontent.com/paritytech/product-sdk/964e6a3eee628c77bb294c0f7b62b210c841e9eb/product-sdk/LICENSE",
+    "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "pin_field": "entries.<sdk_entry>.genesis",
+    "purpose": "External immutable genesis pins, independent of compact-spec state roots. Never replace a pin to accommodate a mismatching fixture or RPC. SDK wsUrl values below are source evidence only, not application fallbacks."
+  },
+  "relay": {
+    "fixture": "chains/paseo.json",
+    "chain_id": "paseo",
+    "state_root_hash": "0x070b57c91484ab48bfa87a8af91ec6c20667aa4b0e7b34e3c0689dd00e7980ca",
+    "action": "Reuse the existing fixture unchanged for all three parachains.",
+    "evidence": "The existing relay fixture ID and genesis.stateRootHash match both public relay sources below. All three compact Next specs declare relay_chain=paseo. Runtime/live relay membership must still be verified by the host; matching the string ID alone is not a cryptographic membership proof.",
+    "sources": [
+      {
+        "url": "https://raw.githubusercontent.com/paritytech/smoldot/6aaa2a8e550f208b3d2182b411c99219680121e0/demo-chain-specs/paseo.json",
+        "revision": "6aaa2a8e550f208b3d2182b411c99219680121e0",
+        "sha256": "72380e9c1515dbb35c30ecd4defe5689c4077a21c18eb8d19cf30dc72a328a00",
+        "license": "GPL-3.0-or-later WITH Classpath-exception-2.0"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/paseo-network/paseo-chain-specs/0f3b655048bdd03e5dc8caaab4711667bc9a089c/paseo.raw.smol.json",
+        "revision": "0f3b655048bdd03e5dc8caaab4711667bc9a089c",
+        "sha256": "f3df38069129767d5310f4b19f44349ca127a359406569bba4ea5c35a489a81d",
+        "license": "Not specified in repository tree; referenced for comparison, not copied."
+      }
+    ]
+  },
+  "chains": [
+    {
+      "role": "asset-hub",
+      "fixture": "chains/paseo_next_asset_hub.json",
+      "chain_id": "next-asset-hub-paseo",
+      "relay_chain": "paseo",
+      "para_id": 1500,
+      "source_path": "demo-chain-specs/paseo_asset_hub_next.json",
+      "source_url": "https://raw.githubusercontent.com/paritytech/smoldot/6aaa2a8e550f208b3d2182b411c99219680121e0/demo-chain-specs/paseo_asset_hub_next.json",
+      "source_sha256": "d701a769e5c7bfbf1b62daa6026b4586a9c237baa857bff5055cfdb677a09fd8",
+      "state_root_hash": "0x07bc7dfd9267d5dbbb3300f3ef0042d6173db91160211215cd9a6ebdfacdb971",
+      "expected_genesis_hash": "0x4349b00e54897e21196fd331015fc5be0f14e118beb0375ed2bb1793737bb57a",
+      "sdk_entry": "paseo_asset_hub",
+      "sdk_descriptor_url": "https://raw.githubusercontent.com/paritytech/product-sdk/964e6a3eee628c77bb294c0f7b62b210c841e9eb/product-sdk/packages/descriptors/chains/paseo-asset-hub/.papi/polkadot-api.json",
+      "sdk_descriptor_sha256": "d66505f342ed72c63bdd75ac2a245e7f206c7e9ea9cea33ed740fce0e191806c",
+      "sdk_rpc_url": "wss://paseo-asset-hub-next-rpc.polkadot.io",
+      "bootnode_source": "Unchanged source spec bootNodes: two WSS collators and four WebRTC-direct peers."
+    },
+    {
+      "role": "bulletin",
+      "fixture": "chains/paseo_next_bulletin.json",
+      "chain_id": "next-bulletin-paseo",
+      "relay_chain": "paseo",
+      "para_id": 1501,
+      "source_path": "demo-chain-specs/paseo_bulletin_next.json",
+      "source_url": "https://raw.githubusercontent.com/paritytech/smoldot/6aaa2a8e550f208b3d2182b411c99219680121e0/demo-chain-specs/paseo_bulletin_next.json",
+      "source_sha256": "8c8a9c78fcd14cd051f3b0615bf4f78c11dcb2dcbbe5e978d2a66c1da6a66bec",
+      "state_root_hash": "0xec731d2141c9f893c8467d28034b1006ace0336c708051516b59d6b628d10190",
+      "expected_genesis_hash": "0x8cfe6717dc4becfda2e13c488a1e2061ff2dfee96e7d031157f72d36716c0a22",
+      "sdk_entry": "paseo_bulletin",
+      "sdk_descriptor_url": "https://raw.githubusercontent.com/paritytech/product-sdk/964e6a3eee628c77bb294c0f7b62b210c841e9eb/product-sdk/packages/descriptors/chains/paseo-bulletin/.papi/polkadot-api.json",
+      "sdk_descriptor_sha256": "2dc68c52b360a46db72b62e6c1ea012497f9c57c72eabeb0b1840eb77fde2df8",
+      "sdk_rpc_url": "wss://paseo-bulletin-next-rpc.polkadot.io",
+      "bootnode_source": "Unchanged source spec bootNodes: four WSS peers and four WebRTC-direct peers. WSS RPC-node hostnames here identify libp2p bootnodes, not JSON-RPC fallbacks."
+    },
+    {
+      "role": "individuality",
+      "fixture": "chains/paseo_next_individuality.json",
+      "chain_id": "next-people-paseo",
+      "relay_chain": "paseo",
+      "para_id": 1502,
+      "source_path": "demo-chain-specs/paseo_people_next.json",
+      "source_url": "https://raw.githubusercontent.com/paritytech/smoldot/6aaa2a8e550f208b3d2182b411c99219680121e0/demo-chain-specs/paseo_people_next.json",
+      "source_sha256": "d9bb0db63a6f90949416e5ff24404519470aca1ba501e1deb0715cb9c2b81a1f",
+      "state_root_hash": "0xfaf9d67ded8dc391ab069407c0658351cebd5dbcec79b499376f71228d6eb98e",
+      "expected_genesis_hash": "0x4a2b5b737de1da59e209b0000a876ec2fa20035dc34fd292a848da32d255ad48",
+      "sdk_entry": "paseo_individuality",
+      "sdk_descriptor_url": "https://raw.githubusercontent.com/paritytech/product-sdk/964e6a3eee628c77bb294c0f7b62b210c841e9eb/product-sdk/packages/descriptors/chains/paseo-individuality/.papi/polkadot-api.json",
+      "sdk_descriptor_sha256": "6866bd7565223f71308442450fce32da8cfea0d3b835ecb76d61c93487c26d55",
+      "sdk_rpc_url": "wss://paseo-people-next-system-rpc.polkadot.io",
+      "bootnode_source": "Unchanged source spec bootNodes: two WSS collators.",
+      "naming": "Individuality is the product SDK role; the public compact source names this chain Paseo People Next. Preserve its upstream chain ID."
+    }
+  ],
+  "genesis_header_derivation": null,
+  "genesis_header_derivation_note": "No fixture was derived from RPC. Existing public compact specs were copied unchanged, so there is no RPC genesis-header evidence to preserve. Independently validate the compact spec's canonical genesis-header hash against the pinned SDK genesis before deployment.",
+  "verification_boundary": "Compact-spec genesis hashes were independently computed and matched to the pinned SDK descriptors. The integrated host obtained verified finalized storage on all three parachains through the shared Paseo relay. This is observed interoperability, not a guarantee of future network availability, runtime compatibility, blob retrieval or Statement Store gossip."
+}

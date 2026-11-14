@@ -51,6 +51,7 @@ impl HostCatalog {
 enum Route {
     Host,
     Chain(usize),
+    Content(usize),
 }
 
 pub struct BoundSocket {
@@ -157,9 +158,13 @@ pub async fn serve(
     .await
     .context("WebSocket handshake timed out")??;
     let route = selected.context("WebSocket handshake did not select a route")?;
+    if let Route::Content(index) = route {
+        return crate::content::serve(socket, engine, &chains[index]).await;
+    }
     let mut session = match route {
         Route::Host => None,
         Route::Chain(index) => Some(Session::open(engine, &chains[index])?),
+        Route::Content(_) => unreachable!("content is served separately"),
     };
     loop {
         let outgoing = tokio::select! {
@@ -212,12 +217,22 @@ fn select_route(request: &Request, chains: &[String]) -> std::result::Result<Rou
     let selected = if request.uri().path() == DISCOVERY_PATH {
         Some(Route::Host)
     } else {
-        request
-            .uri()
-            .path()
-            .strip_prefix("/rpc/")
-            .and_then(|id| chains.iter().position(|chain| chain == id))
-            .map(Route::Chain)
+        [("/rpc/", false), ("/content/", true)]
+            .into_iter()
+            .find_map(|(prefix, content)| {
+                request
+                    .uri()
+                    .path()
+                    .strip_prefix(prefix)
+                    .and_then(|id| chains.iter().position(|chain| chain == id))
+                    .map(|index| {
+                        if content {
+                            Route::Content(index)
+                        } else {
+                            Route::Chain(index)
+                        }
+                    })
+            })
     }
     .filter(|_| request.uri().query().is_none())
     .ok_or_else(|| {
@@ -350,6 +365,41 @@ pub fn read_chain_spec(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_route_is_private_exact_and_does_not_expose_bitswap_rpc() {
+        let chains = vec!["bulletin".to_owned()];
+        let request = Request::builder()
+            .uri("/content/bulletin")
+            .body(())
+            .unwrap();
+        assert_eq!(select_route(&request, &chains).unwrap(), Route::Content(0));
+        for path in [
+            "/content/",
+            "/content/missing",
+            "/content/bulletin/",
+            "/content/bulletin?x=1",
+            "/content/%62ulletin",
+        ] {
+            let request = Request::builder().uri(path).body(()).unwrap();
+            assert_eq!(select_route(&request, &chains).unwrap_err().status(), 404);
+        }
+        for origin in ["https://example.com", "file://", "null", ""] {
+            let request = Request::builder()
+                .uri("/content/bulletin")
+                .header("Origin", origin)
+                .body(())
+                .unwrap();
+            assert_eq!(select_route(&request, &chains).unwrap_err().status(), 403);
+        }
+        for method in [
+            "bitswap_unstable_get",
+            "bitswap_unstable_stream",
+            "bitswap_unstable_unstream",
+        ] {
+            assert!(!allowed_method(method));
+        }
+    }
 
     fn empty_catalog() -> HostCatalog {
         HostCatalog::new(&HostInfo {

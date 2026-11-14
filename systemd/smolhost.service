@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [Unit]
-Description=Smolhost shared Polkadot light client (Paseo)
+Description=Smolhost shared Polkadot light client (Paseo Next v2 apps)
 Requires=smolhost.socket
 After=smolhost.socket
 StartLimitIntervalSec=60
@@ -8,7 +8,7 @@ StartLimitBurst=3
 
 [Service]
 Type=exec
-ExecStart="%h/.local/lib/smolhost/smolhostd" --systemd-socket --socket "%t/smolhost/rpc.sock" --chain-spec "%h/.local/lib/smolhost/paseo.json" --parachain-spec "%h/.local/lib/smolhost/paseo_asset_hub.json" --state-dir "%S/smolhost"
+ExecStart="%h/.local/lib/smolhost/smolhostd" --systemd-socket --socket "%t/smolhost/rpc.sock" --chain-spec "%h/.local/lib/smolhost/paseo.json" --parachain-spec "%h/.local/lib/smolhost/paseo_next_asset_hub.json" --parachain-spec "%h/.local/lib/smolhost/paseo_next_bulletin.json" --parachain-spec "%h/.local/lib/smolhost/paseo_next_individuality.json" --state-dir "%S/smolhost"
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
