@@ -12,14 +12,62 @@ for production funds. Not affiliated with Parity Technologies or the Web3 Founda
 - Gives each connection its own RPC session while sharing chain synchronization.
 - Includes a CLI that follows finalized blocks and reads `System.Number` from
   verified chain storage, plus an opt-in two-process acceptance script.
-- Uses a pinned public Paseo relay-chain specification. No wallet or credentials
-  are needed, and no transactions are submitted.
+- Loads pinned public Paseo relay and Asset Hub specifications in one client.
+  No wallet or credentials are needed, and no transactions are submitted.
 - Can run as an opt-in systemd user service, with a supervisor-owned Unix socket.
-- Saves finalized bootstrap checkpoints every 60 seconds and on clean shutdown.
+- Saves relay bootstrap checkpoints every 60 seconds and on clean shutdown.
 
-There is no parachain support, browser bridge, TCP listener, signing, or Zenoh
-integration. Desktop and mobile are the intended targets; an x86-64 run does not
-establish AArch64 or phone support.
+There is no browser bridge, TCP listener, signing, or Zenoh integration. Desktop
+and mobile are the intended targets; an x86-64 run does not establish AArch64 or
+phone support.
+
+## Chain defaults and application needs
+
+The installed service currently enables **classic Paseo + Asset Hub Paseo**
+(parachain 1000). It does not enable production chains. The relay is a shared
+security dependency, not a separate light client per application or parachain.
+
+For an application-oriented profile, prefer a small capability catalog rather
+than automatically synchronizing every system chain:
+
+| Role | What applications need it for | Policy |
+| --- | --- | --- |
+| Relay chain | Parachain verification and finality | Shared dependency |
+| Asset Hub | Assets, balances, runtime/contract reads, naming where deployed | Current tested default |
+| Bulletin | Content-addressed files, app bundles, media | Candidate for an app profile; blob retrieval also needs Bitswap/IPFS |
+| Individuality / People deployments | Identity, personhood, statement allowances | Select the exact deployment; do not treat these names as interchangeable |
+| Bridge Hub, Collectives, Coretime | Bridges, collectives/fellowship, coretime operations | Explicitly configure only when an application needs them |
+
+The public [Product SDK chain client](https://docs.polkadot.com/apps/product-sdk/chain-client/)
+uses Asset Hub, Bulletin, and Individuality as its three application-facing roles.
+However, its [network presets](https://docs.polkadot.com/apps/concepts/networks/)
+distinguish Paseo Next v2 from Products Devnet; neither is an alias for this
+classic Asset Hub fixture. Match genesis hashes and runtime/deployment metadata,
+not merely a friendly network name. This daemon is not a Product SDK Host provider.
+
+[Individuality](https://github.com/paritytech/individuality-community) describes
+itself as experimental People-chain infrastructure, not part of the official
+People chain. [Bulletin](https://github.com/paritytech/polkadot-bulletin-chain) is a
+storage parachain with authorization and retention rules; ordinary storage RPC
+does not by itself deliver its content-retrieval service.
+
+Beyond chain reads, applications may need:
+
+- Chain/capability discovery, readiness, genesis checking, runtime metadata and
+  a native IPC adapter for their client library.
+- Wallet-mediated signing and explicit transaction approval/submission. Keys
+  should stay outside this read-only daemon.
+- CID-verified blob retrieval and bounded caching for Bulletin; signed-statement
+  gossip, allowances and expiry handling for applications using Statement Store.
+- Network-specific contract/name-service configuration, and optional indexers for
+  history/search that a light client does not provide.
+- Reconnection/resubscription and an idle/suspend policy appropriate for phones.
+
+These are capability boundaries and recommendations, not implemented APIs.
+Currently all explicitly configured chains stay active until the daemon stops.
+Per-chain on-demand activation and idle unloading are not implemented; measure
+their resource/battery tradeoffs before expanding the always-running defaults.
+None of the above requires introducing Zenoh.
 
 ## Build
 
@@ -39,14 +87,21 @@ location. Source and chain state must not be stored in disposable build outputs.
 Start the daemon in one terminal:
 
 ```sh
-./target/debug/polkadot-hostd --chain-spec chains/paseo.json
+./target/debug/polkadot-hostd --chain-spec chains/paseo.json \
+  --parachain-spec chains/paseo_asset_hub.json
 ```
 
 It creates `$XDG_RUNTIME_DIR/polkadot-host/rpc.sock` and connects to public Paseo
 peers. Synchronization may take time; readiness of the socket does not mean the
 chain is synchronized. No remote RPC fallback is used.
 
-The bundled bootnodes use secure WebSockets. A small native platform adapter adds
+`--chain-spec` selects one relay. Repeat `--parachain-spec PATH` for additional
+parachains on that relay; omit it for relay-only operation. Specifications must
+have unique safe route IDs and unique parachain IDs, with matching relay metadata.
+Invalid or ambiguous configurations fail startup. Applications cannot register
+arbitrary chains through RPC.
+
+The bundled bootnodes include secure WebSockets. A small native platform adapter adds
 WSS using Rustls and Mozilla trust roots from `webpki-roots`, with hostname and
 certificate verification enabled. Smoldot's default native platform handles the
 executor, clocks, randomness, and non-TLS connections. TLS does not replace
@@ -55,8 +110,12 @@ smoldot's peer authentication, finality verification, or storage-proof checking.
 In another terminal:
 
 ```sh
-./target/debug/polkadot-host --chain paseo probe --finalizations 3
+./target/debug/polkadot-host --chain asset-hub-paseo probe --finalizations 3
 ```
+
+Use `--chain paseo` to query the shared relay instead. The corresponding handshake
+paths are `/rpc/asset-hub-paseo` and `/rpc/paseo`. A connection selects one chain
+once; its requests and subscriptions remain isolated from other connections.
 
 The probe prints JSON lines: `initialized`, `storage`, `finalized`, and `completed`.
 It reads a four-byte SCALE `System.Number` at the initial finalized block and after
@@ -88,12 +147,12 @@ Requires Linux with a running systemd user manager. No root privileges or sudo:
 ```sh
 python3 scripts/user-service.py install
 systemctl --user enable --now polkadot-host.service
-~/.local/bin/polkadot-host --chain paseo probe --finalizations 3
+~/.local/bin/polkadot-host --chain asset-hub-paseo probe --finalizations 3
 ```
 
 Build both binaries first. The installer defaults to `target/debug`; use
 `--bin-dir /absolute/build/output` for another build. It copies the binaries and
-Paseo spec into `~/.local/lib/polkadot-host`, links the CLI in `~/.local/bin`, and
+Paseo and Asset Hub specs into `~/.local/lib/polkadot-host`, links the CLI in `~/.local/bin`, and
 copies the units into `$XDG_CONFIG_HOME/systemd/user` (normally
 `~/.config/systemd/user`). Nothing runs from disposable build outputs.
 
@@ -154,11 +213,16 @@ to select another location, or `--no-state` to neither read nor write checkpoint
 These options are mutually exclusive. The user service uses systemd's persistent
 `StateDirectory` at the same default location.
 
-Each exact chain-spec fingerprint has a JSON checkpoint and a separate lock file.
-Different spec bytes select a different checkpoint; old files are not deleted.
-Only one daemon can own a given specification's state at a time, even when its
+The relay's exact chain-spec fingerprint has a JSON checkpoint and a separate
+lock file. Different relay spec bytes select a different checkpoint; old files
+are not deleted. Only one daemon can own that relay state at a time, even when its
 IPC socket differs. Directories must be user-owned `0700`; state files must be
 user-owned `0600`. Symlink and nonregular-file endpoints are rejected.
+
+Only relay bootstrap state is persisted. After a restart, parachains derive
+verified progress from the restored/shared relay and fetch their own runtime/state
+as needed. No independent parachain finality checkpoint or application session
+is persisted.
 
 The daemon requests smoldot's `chainHead_unstable_finalizedDatabase` through a
 **private** anchor RPC frontend, not through the application socket. It validates
@@ -194,8 +258,8 @@ checkpoint compatibility decision; this version only loads its pinned format.
 
 ## Verify
 
-Offline checks cover read-only method filtering, socket ownership/lifecycle,
-checkpoint integrity, atomic replacement, permissions, and exclusive writers:
+Offline checks cover chain/parent configuration, route isolation, read-only method
+filtering, socket lifecycle, checkpoint integrity and exclusive writers:
 
 ```sh
 cargo test --locked --lib
@@ -204,8 +268,11 @@ cargo test --locked --lib
 For a live test against public Paseo peers, build both binaries first, then run:
 
 ```sh
-python3 scripts/smoke.py --chain-spec chains/paseo.json --chain paseo
+python3 scripts/smoke.py --chain-spec chains/paseo.json \
+  --parachain-spec chains/paseo_asset_hub.json --chain asset-hub-paseo
 ```
+
+For the relay-only scenario, omit `--parachain-spec` and use `--chain paseo`.
 
 The script uses its own temporary directory and daemon. It requires:
 
@@ -213,7 +280,7 @@ The script uses its own temporary directory and daemon. It requires:
 2. Client A completing and exiting while client B continues to read later finalized
    state and then completes successfully.
 3. Both sessions being released without stopping the daemon.
-4. Exactly one smoldot chain initialization across those connections.
+4. Exactly one relay initialization and one initialization per configured parachain.
 
 The script uses `--no-state`, so it never touches your persistent checkpoints.
 It prints a JSON result and stops its child processes on success, failure, or
@@ -224,20 +291,24 @@ unit test.
 
 ### Why the sharing evidence matters
 
-One `smoldot_light::Client` owns an RPC-free anchor handle and the per-connection
-handles. Smoldot 4.0.0 deduplicates chain services by its internal chain key, while
-creating a distinct RPC frontend on each `add_chain` call. Its
-`Chain initialization complete` log is emitted only when those services are first
-created, not when another handle attaches. The acceptance script combines that
-upstream event with two active sessions and actual chain reads; session counts
-alone would not establish sharing.
+One `smoldot_light::Client` owns the relay anchor, parachain anchors, and each
+connection's RPC handle. Every parachain handle references the same relay anchor;
+disconnecting an application never removes that anchor. Smoldot 4.0.0 deduplicates
+chain services by its internal chain key while creating a distinct RPC frontend
+on each `add_chain` call.
+
+Its `Chain initialization complete` and `Parachain initialization complete` logs
+are emitted only when the corresponding services are first created. The
+acceptance script requires exactly one event for every configured chain, plus
+two active sessions and actual chain reads. Session counts alone would not prove
+sharing. The relay's checkpoint RPC frontend remains private.
 
 See the pinned [upstream implementation](https://docs.rs/crate/smoldot-light/4.0.0/source/src/lib.rs)
 (`chains_by_key`, `Entry::Occupied`, `Entry::Vacant`, and RPC frontend creation).
 
 ## IPC and safety boundaries
 
-- Endpoint path in the WebSocket handshake: `/rpc/paseo` for the bundled chain.
+- Handshake paths are `/rpc/<configured-chain-id>`; unknown routes are rejected.
   There is no TCP/HTTP listener for browsers; `file://` pages cannot access it.
 - Private socket directory, socket mode `0600`, and same-effective-UID checks on
   both ends. Browser-origin handshakes and unknown chain paths are rejected.
@@ -265,45 +336,48 @@ See the pinned [upstream implementation](https://docs.rs/crate/smoldot-light/4.0
 - SHA-256: `72380e9c1515dbb35c30ecd4defe5689c4077a21c18eb8d19cf30dc72a328a00`
 - Upstream [license](https://github.com/paritytech/smoldot/blob/6aaa2a8e550f208b3d2182b411c99219680121e0/LICENSE): GNU GPL v3.
 
+`chains/paseo_asset_hub.json` is also unmodified:
+
+- [Source at the same revision](https://github.com/paritytech/smoldot/blob/6aaa2a8e550f208b3d2182b411c99219680121e0/demo-chain-specs/paseo_asset_hub.json)
+- SHA-256: `d50dc59e4d1f48f203542d0de2149928b26a640902ba8bd9351acdf64fed0b27`
+- Route `asset-hub-paseo`, relay `paseo`, parachain ID 1000; same upstream license.
+
 The pin makes this experiment reproducible; it is not an indefinitely fresh trust
 checkpoint. Chain-spec/checkpoint updates need explicit provenance and review.
 
 ## Observed verification
 
-The initial live acceptance run passed on x86-64 Linux with Rust 1.98.1:
+Verified on x86-64 Linux with Rust 1.98.1 and systemd 261.
 
-- One smoldot chain initialization and two simultaneous RPC sessions.
-- Both clients read verified `System.Number` values and exited successfully.
-- Client A finished at finalized block 1,932,326; after A exited, client B
-  continued through block 1,932,329
-  (`0x96e03c879d31019318d721710d8755939ad26f52eb9d8e4d55c34398659a69f7`).
-- Both sessions were released; the script stopped its temporary daemon.
+The live Asset Hub acceptance run passed against public peers:
 
-A subsequent systemd 261 user-manager run verified:
+- Exactly one relay and one parachain initialization, with two simultaneous
+  application sessions on Asset Hub.
+- Both clients read verified four-byte `System.Number` values and exited
+  successfully. Client A finished at parachain block 15,741,964; client B
+  continued through blocks 15,741,965–15,741,967 after A exited.
+- Both sessions were released and the temporary daemon stopped.
+- Eight engine and nine IPC tests passed, including invalid parent/ID rejection
+  and configured-route selection.
 
-- Socket activation with two concurrent clients and one chain initialization.
-- Graceful daemon restart and automatic recovery after `SIGKILL`, preserving the
-  socket inode and accepting fresh clients afterward.
-- Enable/disable without losing the installation; uninstall while enabled and
-  running; protection of conflicting, modified, and unrelated files.
-- Verified state through block 1,932,779 after installing the final unit layout.
+The installed two-chain service also passed live checks:
 
-All six offline IPC tests passed, including inherited-listener lifetime and
-permission checks. The test installation was removed afterward. Login/reboot,
-suspend/resume, and mobile behavior were not exercised.
+- Simultaneous relay and Asset Hub reads returned distinct genesis hashes, with
+  one initialization per chain. An unconfigured route returned HTTP 404.
+- Clean shutdown saved relay block 1,938,416. On restart smoldot reported that
+  database starting point, and Asset Hub advanced from block 15,742,183 before
+  restart to 15,742,198 afterward. Only the relay checkpoint was written.
+- Uninstall preserved the checkpoint. Receipt-based removal also preserved an
+  unrecorded file when exercising an older installation's file set.
 
-Persistence verification subsequently passed against public Paseo peers:
+The test installation and temporary checkpoints were removed; no service was left
+running. The service test used a private temporary state-directory override,
+retaining the packaged relay/parachain arguments and `0700` directory mode.
 
-- A periodic checkpoint captured finalized block 1,933,109. After `SIGKILL`,
-  smoldot reported **Database starting at block 1,933,109**, then the probe read
-  verified state at 1,933,110.
-- Clean shutdown saved block 1,933,111; the restarted service resumed there and
-  returned verified state at 1,933,112.
-- Two application sessions still shared one chain initialization. A second
-  checkpoint writer was refused, corrupt state remained untouched, and
-  `--no-state` returned verified state without creating persistent files.
-- All 17 offline tests passed across targeted runs. Temporary service units and
-  test checkpoints were removed.
+Earlier relay-only checks also exercised periodic/clean-shutdown checkpoint
+restoration, automatic recovery after `SIGKILL`, preservation of the socket inode,
+exclusive checkpoint writers, corrupt-state rejection, `--no-state`, and installer
+ownership checks. Nine state tests passed during that checkpoint implementation.
 
 This does not establish mobile compatibility, reboot/suspend behavior, or
 production security.
@@ -316,8 +390,8 @@ findings, and contributions are welcome in
 [GitHub issues](https://github.com/replghost/polkadot-host/issues). Explain what
 you changed and tested; do not post secrets or sensitive vulnerability details.
 
-The next experiments are a parachain and actual AArch64/mobile validation.
-Neither is implied by a successful relay-chain run.
+The next experiments are application-facing discovery/client adapters and actual
+AArch64/mobile validation, not an automatic rollout of every system chain.
 
 ## License
 

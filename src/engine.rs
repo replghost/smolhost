@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
+    collections::{BTreeMap, HashSet},
     num::NonZeroU32,
     sync::{Arc, Mutex},
 };
@@ -15,27 +16,26 @@ pub type SharedEngine = Arc<Mutex<Engine>>;
 
 pub struct Engine {
     client: Client<Platform>,
-    specification: String,
+    chains: BTreeMap<String, ConfiguredChain>,
     active_sessions: usize,
+}
+
+struct ConfiguredChain {
+    specification: String,
+    relay_anchor: Option<ChainId>,
+    // Only session handles are removed; anchors live until the client is dropped.
+    _anchor_id: ChainId,
 }
 
 impl Engine {
     pub fn new(
         specification: String,
         database_content: Option<&str>,
-    ) -> Result<(SharedEngine, String, Option<CheckpointClient>)> {
-        let spec = smoldot::chain_spec::ChainSpec::from_json_bytes(&specification)
-            .context("parsing chain specification")?;
-        let chain = spec.id().to_owned();
-        let block_number_bytes = usize::from(spec.block_number_bytes());
-        drop(spec);
-        ensure!(
-            !chain.is_empty()
-                && chain
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "chain id must contain only ASCII letters, digits, hyphens, or underscores"
-        );
+        parachain_specifications: Vec<String>,
+    ) -> Result<(SharedEngine, Vec<String>, Option<CheckpointClient>)> {
+        // Reject the entire configuration before creating any chain services.
+        let (chains, block_number_bytes) =
+            validate_specifications(&specification, &parachain_specifications)?;
         let mut client = Client::new(Platform::new());
         // The anchor keeps sync alive without counting as an application session.
         // Its optional RPC frontend is private to checkpointing.
@@ -52,11 +52,40 @@ impl Engine {
                 &specification,
                 database_content.unwrap_or(""),
                 json_rpc,
+                None,
             ))
-            .map_err(|error| anyhow::anyhow!("adding chain: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("adding relay chain: {error}"))?;
+        let relay_anchor = added.chain_id;
+        let mut configured = BTreeMap::new();
+        configured.insert(
+            chains[0].clone(),
+            ConfiguredChain {
+                specification,
+                relay_anchor: None,
+                _anchor_id: relay_anchor,
+            },
+        );
+        for (chain, specification) in chains.iter().skip(1).zip(parachain_specifications) {
+            let anchor = client
+                .add_chain(config(
+                    &specification,
+                    "",
+                    AddChainConfigJsonRpc::Disabled,
+                    Some(relay_anchor),
+                ))
+                .map_err(|error| anyhow::anyhow!("adding parachain {chain}: {error}"))?;
+            configured.insert(
+                chain.clone(),
+                ConfiguredChain {
+                    specification,
+                    relay_anchor: Some(relay_anchor),
+                    _anchor_id: anchor.chain_id,
+                },
+            );
+        }
         let engine = Arc::new(Mutex::new(Self {
             client,
-            specification,
+            chains: configured,
             active_sessions: 0,
         }));
         let checkpoint = if database_content.is_some() {
@@ -73,21 +102,100 @@ impl Engine {
         } else {
             None
         };
-        log::info!("host: engine ready chain={chain}");
-        Ok((engine, chain, checkpoint))
+        for chain in &chains {
+            log::info!("host: engine ready chain={chain}");
+        }
+        Ok((engine, chains, checkpoint))
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParachainMetadata<'a> {
+    #[serde(borrow, alias = "relay_chain")]
+    relay_chain: Option<&'a RawValue>,
+    #[serde(borrow, alias = "para_id")]
+    para_id: Option<&'a RawValue>,
+}
+
+fn parse_specification(
+    specification: &str,
+    parachain: bool,
+) -> Result<smoldot::chain_spec::ChainSpec> {
+    // Inspect both fields explicitly: relay_chain() alone cannot distinguish
+    // absent metadata from an incomplete pair. Keep upstream's field aliases.
+    let metadata: ParachainMetadata<'_> =
+        serde_json::from_str(specification).context("parsing chain metadata")?;
+    if parachain {
+        ensure!(
+            metadata.relay_chain.is_some() && metadata.para_id.is_some(),
+            "parachain specification requires both relay_chain and para_id"
+        );
+    } else {
+        ensure!(
+            metadata.relay_chain.is_none() && metadata.para_id.is_none(),
+            "relay specification must not contain parachain metadata"
+        );
+    }
+    let spec = smoldot::chain_spec::ChainSpec::from_json_bytes(specification)
+        .context("parsing chain specification")?;
+    ensure!(
+        !spec.id().is_empty()
+            && spec
+                .id()
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "chain id must contain only ASCII letters, digits, hyphens, or underscores"
+    );
+    Ok(spec)
+}
+
+fn validate_specifications(
+    specification: &str,
+    parachain_specifications: &[String],
+) -> Result<(Vec<String>, usize)> {
+    let relay = parse_specification(specification, false).context("invalid relay specification")?;
+    let block_number_bytes = usize::from(relay.block_number_bytes());
+    let mut chains = Vec::with_capacity(1 + parachain_specifications.len());
+    chains.push(relay.id().to_owned());
+    let mut para_ids = HashSet::with_capacity(parachain_specifications.len());
+    for specification in parachain_specifications {
+        let spec =
+            parse_specification(specification, true).context("invalid parachain specification")?;
+        let (parent, para_id) = spec
+            .relay_chain()
+            .context("parachain specification lacks complete parent metadata")?;
+        ensure!(
+            parent == relay.id(),
+            "parachain {} requires relay {parent}, not {}",
+            spec.id(),
+            relay.id()
+        );
+        ensure!(
+            !chains.iter().any(|chain| chain == spec.id()),
+            "duplicate chain route id: {}",
+            spec.id()
+        );
+        ensure!(
+            para_ids.insert(para_id),
+            "duplicate parachain id: {para_id}"
+        );
+        chains.push(spec.id().to_owned());
+    }
+    Ok((chains, block_number_bytes))
 }
 
 fn config<'a>(
     specification: &'a str,
     database_content: &'a str,
     json_rpc: AddChainConfigJsonRpc,
-) -> AddChainConfig<'a, (), std::iter::Empty<ChainId>> {
+    relay_anchor: Option<ChainId>,
+) -> AddChainConfig<'a, (), std::option::IntoIter<ChainId>> {
     AddChainConfig {
         specification,
         json_rpc,
         database_content,
-        potential_relay_chains: std::iter::empty(),
+        potential_relay_chains: relay_anchor.into_iter(),
         user_data: (),
         statement_protocol_config: None,
         max_pending_transactions: NonZeroU32::new(1).unwrap(),
@@ -218,26 +326,28 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn open(engine: SharedEngine) -> Result<Self> {
+    pub fn open(engine: SharedEngine, chain: &str) -> Result<Self> {
         let mut locked = engine.lock().expect("engine lock poisoned");
         let Engine {
             client,
-            specification,
+            chains,
             active_sessions,
         } = &mut *locked;
+        let configured = chains.get(chain).context("unknown chain route")?;
         // Smoldot deduplicates chain services but creates a fresh RPC frontend.
         let added = client
             .add_chain(config(
-                specification,
+                &configured.specification,
                 "",
                 AddChainConfigJsonRpc::Enabled {
                     max_pending_requests: NonZeroU32::new(32).unwrap(),
                     max_subscriptions: 8,
                 },
+                configured.relay_anchor,
             ))
             .map_err(|error| anyhow::anyhow!("adding session: {error}"))?;
         *active_sessions += 1;
-        log::info!("host: session opened active={active_sessions}");
+        log::info!("host: session opened active={active_sessions} chain={chain}");
         drop(locked);
         Ok(Self {
             engine,
@@ -269,7 +379,7 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_snapshot;
+    use super::{validate_snapshot, validate_specifications};
     use smoldot::{
         chain::chain_information::{
             ChainInformation, ChainInformationConsensus, ChainInformationFinality,
@@ -278,6 +388,132 @@ mod tests {
         database::finalized_serialize,
         header::{DigestItemRef, DigestRef, GrandpaConsensusLogRef, Header, HeaderRef},
     };
+
+    // These fixtures exercise configuration only, without a client or network.
+    fn specification(id: &str, metadata: serde_json::Value) -> String {
+        let mut spec = serde_json::json!({
+            "name": "Configuration test",
+            "id": id,
+            "bootNodes": [],
+            "genesis": {"raw": {"top": {}, "childrenDefault": {}}}
+        });
+        spec.as_object_mut()
+            .unwrap()
+            .extend(metadata.as_object().unwrap().clone());
+        spec.to_string()
+    }
+
+    #[test]
+    fn accepts_relay_only_and_explicit_parachains() {
+        let relay = specification("relay", serde_json::json!({"blockNumberBytes": 8}));
+        assert_eq!(
+            validate_specifications(&relay, &[]).unwrap(),
+            (vec!["relay".to_owned()], 8)
+        );
+        let parachains = [
+            specification(
+                "asset-hub",
+                serde_json::json!({"relay_chain": "relay", "para_id": 1000}),
+            ),
+            specification(
+                "other_chain",
+                serde_json::json!({"relayChain": "relay", "paraId": 1001}),
+            ),
+        ];
+        let (routes, width) = validate_specifications(&relay, &parachains).unwrap();
+        assert_eq!(routes, ["relay", "asset-hub", "other_chain"]);
+        assert_eq!(width, 8);
+    }
+
+    #[test]
+    fn rejects_missing_incomplete_and_wrong_parent_metadata() {
+        let relay = specification("relay", serde_json::json!({}));
+        for metadata in [
+            serde_json::json!({}),
+            serde_json::json!({"relay_chain": "relay"}),
+            serde_json::json!({"para_id": 1000}),
+            serde_json::json!({"relay_chain": "relay", "para_id": null}),
+            serde_json::json!({"relay_chain": null, "para_id": 1000}),
+            serde_json::json!({"relay_chain": null, "para_id": null}),
+            serde_json::json!({"relayChain": "relay"}),
+            serde_json::json!({"paraId": 1000}),
+            serde_json::json!({"relay_chain": "wrong-relay", "para_id": 1000}),
+            serde_json::json!({"relay_chain": "", "para_id": 1000}),
+            serde_json::json!({"relay_chain": "relay", "para_id": -1}),
+            serde_json::json!({"relay_chain": "relay", "para_id": "1000"}),
+            serde_json::json!({"relay_chain": "relay", "para_id": 4294967296u64}),
+        ] {
+            let parachain = specification("asset-hub", metadata.clone());
+            assert!(
+                validate_specifications(&relay, &[parachain]).is_err(),
+                "accepted invalid metadata: {metadata}"
+            );
+        }
+        // A perfectly valid relay spec still cannot be installed as a parachain.
+        assert!(validate_specifications(&relay, &[relay.clone()]).is_err());
+    }
+
+    #[test]
+    fn rejects_parachain_metadata_on_relay_input() {
+        for metadata in [
+            serde_json::json!({"relay_chain": "parent", "para_id": 1000}),
+            serde_json::json!({"relay_chain": "parent"}),
+            serde_json::json!({"para_id": 1000}),
+            serde_json::json!({"relayChain": "parent", "paraId": 1000}),
+        ] {
+            let relay = specification("relay", metadata);
+            assert!(validate_specifications(&relay, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_routes_and_parachain_ids() {
+        let relay = specification("relay", serde_json::json!({}));
+        let para = |id, para_id| {
+            specification(
+                id,
+                serde_json::json!({"relay_chain": "relay", "para_id": para_id}),
+            )
+        };
+        for parachains in [
+            vec![para("relay", 1000)],
+            vec![para("asset-hub", 1000), para("asset-hub", 1001)],
+            vec![para("asset-hub", 1000), para("alias", 1000)],
+        ] {
+            assert!(validate_specifications(&relay, &parachains).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_route_ids_for_every_chain() {
+        let relay = specification("relay", serde_json::json!({}));
+        for id in ["", ".", "..", "a/b", "a?b", "a#b", "a%2Fb", "a b", "páséo"] {
+            let invalid_relay = specification(id, serde_json::json!({}));
+            assert!(validate_specifications(&invalid_relay, &[]).is_err());
+            let invalid_para = specification(
+                id,
+                serde_json::json!({"relay_chain": "relay", "para_id": 1000}),
+            );
+            assert!(validate_specifications(&relay, &[invalid_para]).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_upstream_specs_and_duplicate_metadata_fields() {
+        let relay = specification("relay", serde_json::json!({}));
+        assert!(validate_specifications("not JSON", &[]).is_err());
+        assert!(validate_specifications(r#"{"id":"relay"}"#, &[]).is_err());
+        assert!(validate_specifications(&relay, &["{}".to_owned()]).is_err());
+        let ambiguous = specification(
+            "asset-hub",
+            serde_json::json!({
+                "relay_chain": "relay",
+                "relayChain": "different-parent",
+                "para_id": 1000
+            }),
+        );
+        assert!(validate_specifications(&relay, &[ambiguous]).is_err());
+    }
 
     #[test]
     fn rejects_unusable_finalized_databases() {

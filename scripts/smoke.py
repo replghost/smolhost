@@ -20,6 +20,8 @@ import time
 
 HASH = re.compile(r"0x[0-9a-fA-F]{64}\Z")
 VALUE = re.compile(r"0x[0-9a-fA-F]{8}\Z")
+CHAIN_ID = re.compile(r"[A-Za-z0-9_-]+\Z")
+INITIALIZATION = re.compile(r"(Chain|Parachain) initialization complete for ([^ ]+)\. Name: ")
 MAX_LINE = 1024 * 1024
 MAX_EVENTS = 4096
 
@@ -47,12 +49,38 @@ class Smoke:
         self.buffers = {}
         self.ready = False
         self.engine_ready = False
-        self.initializations = 0
+        self.relay_chain = None
+        self.parachains = []
+        self.expected_initializations = Counter()
+        self.initializations = Counter()
         self.session_counts = deque(maxlen=128)
         self.logs = deque(maxlen=128)
         self.a_exited = False
         self.genesis = None
         self.sequence = 0
+
+    def configure_chains(self):
+        ids = []
+        for path in [self.args.chain_spec, *self.args.parachain_spec]:
+            if not path.is_file():
+                raise SmokeFailure("chain specification is not a regular file")
+            try:
+                specification = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, UnicodeError, RecursionError):
+                raise SmokeFailure("chain specification is not valid JSON") from None
+            chain = specification.get("id") if isinstance(specification, dict) else None
+            if not isinstance(chain, str) or not CHAIN_ID.fullmatch(chain):
+                raise SmokeFailure("chain specification has an invalid route ID")
+            if chain in ids:
+                raise SmokeFailure("configured chain specifications have duplicate route IDs")
+            ids.append(chain)
+        self.relay_chain, *self.parachains = ids
+        self.expected_initializations = Counter(
+            [("Chain", self.relay_chain)]
+            + [("Parachain", chain) for chain in self.parachains]
+        )
+        if self.args.chain not in ids:
+            raise SmokeFailure("requested route is not a configured chain")
 
     def start(self, name, command):
         environment = os.environ.copy()
@@ -80,10 +108,11 @@ class Smoke:
             self.logs.append("host: listening socket=<temporary socket>")
         match = re.search(r"host: engine ready chain=([A-Za-z0-9_-]+)(?:\s|$)", text)
         if match:
-            if match[1] != self.args.chain:
+            if match[1] not in [self.relay_chain, *self.parachains]:
                 raise SmokeFailure("daemon initialized an unexpected chain")
-            self.engine_ready = True
-            self.logs.append("host: engine ready chain=" + self.args.chain)
+            if match[1] == self.relay_chain:
+                self.engine_ready = True
+            self.logs.append("host: engine ready chain=" + match[1])
         match = re.search(r"host: session (opened|closed) active=(\d+)(?:\s|$)", text)
         if match:
             active = int(match[2])
@@ -91,12 +120,14 @@ class Smoke:
                 raise SmokeFailure("unexpected extra daemon session")
             self.session_counts.append(active)
             self.logs.append(f"host: session {match[1]} active={active}")
-        marker = "Chain initialization complete for " + self.args.chain + "."
-        if marker in text:
-            self.initializations += text.count(marker)
-            self.logs.append("smoldot: chain initialization complete chain=" + self.args.chain)
-            if self.initializations > 1:
-                raise SmokeFailure("smoldot initialized the configured chain more than once")
+        for match in INITIALIZATION.finditer(text):
+            key = (match[1], match[2])
+            self.initializations[key] += 1
+            if key not in self.expected_initializations:
+                raise SmokeFailure("smoldot initialized an unexpected chain or chain kind")
+            if self.initializations[key] > 1:
+                raise SmokeFailure("smoldot initialized a configured chain more than once")
+            self.logs.append(f"smoldot: {match[1].lower()} initialization complete chain={match[2]}")
 
     def client_line(self, child, text):
         try:
@@ -242,8 +273,11 @@ class Smoke:
         ]
 
     def run(self, socket):
-        self.start("daemon", [str(self.args.bin_dir / "polkadot-hostd"),
-                              "--chain-spec", str(self.args.chain_spec), "--socket", socket, "--no-state"])
+        command = [str(self.args.bin_dir / "polkadot-hostd"),
+                   "--chain-spec", str(self.args.chain_spec), "--socket", socket, "--no-state"]
+        for path in self.args.parachain_spec:
+            command.extend(["--parachain-spec", str(path)])
+        self.start("daemon", command)
         while not self.ready:
             self.pump()
         for name, finalizations in (("A", 1), ("B", 4)):
@@ -260,8 +294,8 @@ class Smoke:
                     raise SmokeFailure("B did not produce finalized storage after A exited")
                 if 2 not in self.session_counts:
                     raise SmokeFailure("daemon never observed two concurrent sessions")
-                if not self.engine_ready or self.initializations != 1:
-                    raise SmokeFailure("missing single smoldot chain initialization evidence")
+                if not self.engine_ready or self.initializations != self.expected_initializations:
+                    raise SmokeFailure("missing exactly one smoldot initialization per configured chain")
                 # The closed-session log can precede OS process reaping. Require
                 # zero active handles once both successful exits are observed.
                 if self.session_counts and self.session_counts[-1] == 0:
@@ -304,15 +338,28 @@ class Smoke:
         report = {
             "ok": failure is None,
             "chain": self.args.chain,
+            "relay_chain": self.relay_chain,
+            "parachains": self.parachains,
             "genesis_hash": self.genesis,
             "clients": clients,
             "b_finalized_storage_after_a_exit": self.post_disconnect_blocks(),
             "concurrent_sessions_observed": 2 in self.session_counts,
             "session_cleanup_observed": bool(self.session_counts) and self.session_counts[-1] == 0,
-            "smoldot_chain_initializations": self.initializations,
+            "smoldot_chain_initializations": sum(
+                count for (kind, _), count in self.initializations.items() if kind == "Chain"
+            ),
+            "smoldot_parachain_initializations": {
+                chain: self.initializations[("Parachain", chain)] for chain in self.parachains
+            },
+            "configured_initializations_observed": (
+                bool(self.expected_initializations)
+                and self.initializations == self.expected_initializations
+            ),
             "sharing_evidence": (
-                "single smoldot chain initialization; two concurrent RPC session handles"
-                if self.initializations == 1 and 2 in self.session_counts else "not established"
+                "one smoldot initialization per configured chain; two concurrent RPC session handles"
+                if self.expected_initializations
+                and self.initializations == self.expected_initializations
+                and 2 in self.session_counts else "not established"
             ),
             "sharing_evidence_limit": "session counts alone do not prove shared network synchronization",
         }
@@ -327,7 +374,8 @@ class Smoke:
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 
     def sanitize(self, text):
-        for path in (str(self.args.chain_spec), str(self.args.bin_dir), str(Path.home())):
+        for path in (str(self.args.chain_spec), *(str(path) for path in self.args.parachain_spec),
+                     str(self.args.bin_dir), str(Path.home())):
             text = text.replace(path, "<local-path>")
         return re.sub(r"/tmp/polkadot-host-smoke-[^/\s]+", "<temporary-directory>", text)
 
@@ -346,10 +394,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, default=Path("target/debug"))
     parser.add_argument("--chain-spec", type=Path, required=True)
+    parser.add_argument("--parachain-spec", type=Path, action="append", default=[],
+                        help="parachain specification to load alongside the relay (repeatable)")
     parser.add_argument("--chain", required=True)
     parser.add_argument("--timeout-secs", type=positive_integer, default=300)
     args = parser.parse_args()
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.chain):
+    if not CHAIN_ID.fullmatch(args.chain):
         parser.error("chain must contain only ASCII letters, digits, underscores, or hyphens")
     smoke = Smoke(args)
     failure = None
@@ -364,8 +414,7 @@ def main():
             path = args.bin_dir / binary
             if not path.is_file() or not os.access(path, os.X_OK):
                 raise SmokeFailure("required already-built executable unavailable: " + binary)
-        if not args.chain_spec.is_file():
-            raise SmokeFailure("chain specification is not a regular file")
+        smoke.configure_chains()
         # A fixed system temporary root avoids excessively long Unix socket paths.
         temporary = tempfile.TemporaryDirectory(prefix="polkadot-host-smoke-", dir="/tmp")
         os.chmod(temporary.name, 0o700)

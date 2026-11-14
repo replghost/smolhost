@@ -14,7 +14,7 @@ import sys
 
 REPO = Path(__file__).resolve().parent.parent
 UNITS = ("polkadot-host.service", "polkadot-host.socket")
-FILES = ("polkadot-host", "polkadot-hostd", "paseo.json", *UNITS)
+FILES = ("polkadot-host", "polkadot-hostd", "paseo.json", "paseo_asset_hub.json", *UNITS)
 RECEIPT = "installed-files.json"
 
 
@@ -59,6 +59,7 @@ def install(bin_dir):
         "polkadot-host": bin_dir / "polkadot-host",
         "polkadot-hostd": bin_dir / "polkadot-hostd",
         "paseo.json": REPO / "chains/paseo.json",
+        "paseo_asset_hub.json": REPO / "chains/paseo_asset_hub.json",
         **{name: REPO / "systemd" / name for name in UNITS},
     }
     for name, source in sources.items():
@@ -112,10 +113,15 @@ def uninstall():
     if receipt.is_symlink():
         raise RuntimeError("refusing a symlinked installation receipt")
     checksums = json.loads(receipt.read_text())
-    if not isinstance(checksums, dict) or set(checksums) != set(FILES):
+    required = {"polkadot-host", "polkadot-hostd", *UNITS}
+    if (
+        not isinstance(checksums, dict)
+        or not required.issubset(checksums)
+        or not set(checksums).issubset(files)
+    ):
         raise RuntimeError("invalid installation receipt")
     # Check everything before stopping services or deleting anything.
-    for name in FILES:
+    for name in checksums:
         path = files[name]
         if exists(path) and (path.is_symlink() or not path.is_file() or digest(path) != checksums[name]):
             raise RuntimeError(f"modified installation file: {path}; preserve it before uninstalling")
@@ -128,8 +134,10 @@ def uninstall():
             if not link.is_symlink() or link.readlink() != links[link]:
                 raise RuntimeError(f"installation changed during uninstall: {link}")
             link.unlink()
-    for path in (*files.values(), receipt):
-        path.unlink(missing_ok=True)
+    # The receipt, not today's package contents, defines what this install owns.
+    for name in checksums:
+        files[name].unlink(missing_ok=True)
+    receipt.unlink()
     try:
         bundle.rmdir()
     except OSError as error:

@@ -22,9 +22,12 @@ use tokio::{
     about = "Experimental read-only light-client RPC over a private Unix socket"
 )]
 struct Args {
-    /// Public relay-chain specification. The spike does not load parachains.
+    /// Public relay-chain specification shared by all configured parachains.
     #[arg(long)]
     chain_spec: PathBuf,
+    /// Public parachain specification; repeat for additional chains on this relay.
+    #[arg(long)]
+    parachain_spec: Vec<PathBuf>,
     /// Absolute socket path in a private, user-owned directory.
     #[arg(long)]
     socket: Option<PathBuf>,
@@ -71,6 +74,11 @@ fn main() -> Result<()> {
 
 async fn run(args: Args, inherited: Option<std::os::unix::net::UnixListener>) -> Result<()> {
     let specification = ipc::read_chain_spec(&args.chain_spec)?;
+    let parachain_specifications = args
+        .parachain_spec
+        .iter()
+        .map(|path| ipc::read_chain_spec(path))
+        .collect::<Result<Vec<_>>>()?;
     let store = if args.no_state {
         None
     } else {
@@ -92,9 +100,10 @@ async fn run(args: Args, inherited: Option<std::os::unix::net::UnixListener>) ->
         Some(listener) => BoundSocket::from_inherited(path.clone(), listener)?,
         None => BoundSocket::bind(path.clone())?,
     };
-    let (engine, chain, control) = Engine::new(
+    let (engine, chains, control) = Engine::new(
         specification,
         store.as_ref().map(|_| database.as_deref().unwrap_or("")),
+        parachain_specifications,
     )?;
     // The engine consumes the bootstrap data while adding the anchor.
     drop(database);
@@ -108,7 +117,7 @@ async fn run(args: Args, inherited: Option<std::os::unix::net::UnixListener>) ->
         }
         _ => None,
     };
-    let chain = Arc::new(chain);
+    let chains = Arc::new(chains);
     let permits = Arc::new(Semaphore::new(16));
     let mut tasks = JoinSet::new();
     let mut terminate = signal(SignalKind::terminate())?;
@@ -128,10 +137,10 @@ async fn run(args: Args, inherited: Option<std::os::unix::net::UnixListener>) ->
                     continue;
                 };
                 let engine = engine.clone();
-                let chain = chain.clone();
+                let chains = chains.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = ipc::serve(stream, &chain, engine).await {
+                    if let Err(error) = ipc::serve(stream, &chains, engine).await {
                         log::warn!("host: session ended: {error:#}");
                     }
                 });

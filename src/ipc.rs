@@ -104,26 +104,15 @@ impl Drop for BoundSocket {
     }
 }
 
-pub async fn serve(stream: UnixStream, chain: &str, engine: SharedEngine) -> Result<()> {
+pub async fn serve(stream: UnixStream, chains: &[String], engine: SharedEngine) -> Result<()> {
     ensure!(
         stream.peer_cred()?.uid() == rustix::process::geteuid().as_raw(),
         "peer UID mismatch"
     );
-    let expected_path = format!("/rpc/{chain}");
+    let mut selected = None;
     let callback =
         |request: &Request, response: Response| -> std::result::Result<Response, ErrorResponse> {
-            if request.uri().path() != expected_path || request.uri().query().is_some() {
-                return Err(tokio_tungstenite::tungstenite::http::Response::builder()
-                    .status(404)
-                    .body(Some("unknown chain endpoint".into()))
-                    .unwrap());
-            }
-            if request.headers().contains_key("origin") {
-                return Err(tokio_tungstenite::tungstenite::http::Response::builder()
-                    .status(403)
-                    .body(Some("browser origins are not supported".into()))
-                    .unwrap());
-            }
+            selected = Some(select_chain(request, chains)?);
             Ok(response)
         };
     let config = WebSocketConfig::default()
@@ -135,7 +124,8 @@ pub async fn serve(stream: UnixStream, chain: &str, engine: SharedEngine) -> Res
     )
     .await
     .context("WebSocket handshake timed out")??;
-    let mut session = Session::open(engine)?;
+    let index = selected.context("WebSocket handshake did not select a chain")?;
+    let mut session = Session::open(engine, &chains[index])?;
     loop {
         let outgoing = tokio::select! {
             message = socket.next() => {
@@ -165,6 +155,28 @@ pub async fn serve(stream: UnixStream, chain: &str, engine: SharedEngine) -> Res
             .await
             .context("client is not consuming responses")??;
     }
+}
+
+fn select_chain(request: &Request, chains: &[String]) -> std::result::Result<usize, ErrorResponse> {
+    let selected = request
+        .uri()
+        .path()
+        .strip_prefix("/rpc/")
+        .and_then(|id| chains.iter().position(|chain| chain == id))
+        .filter(|_| request.uri().query().is_none())
+        .ok_or_else(|| {
+            tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(404)
+                .body(Some("unknown chain endpoint".into()))
+                .unwrap()
+        })?;
+    if request.headers().contains_key("origin") {
+        return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(403)
+            .body(Some("browser origins are not supported".into()))
+            .unwrap());
+    }
+    Ok(selected)
 }
 
 fn allowed_method(method: &str) -> bool {
@@ -249,6 +261,69 @@ pub fn read_chain_spec(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_selects_only_configured_chain_routes() {
+        let chains = vec!["paseo".to_owned(), "asset-hub-paseo".to_owned()];
+        for (index, chain) in chains.iter().enumerate() {
+            let request = Request::builder()
+                .uri(format!("/rpc/{chain}"))
+                .body(())
+                .unwrap();
+            assert_eq!(select_chain(&request, &chains).unwrap(), index);
+        }
+        let request = Request::builder()
+            .uri("/rpc/asset-hub-paseo")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            select_chain(&request, &chains[..1]).unwrap_err().status(),
+            404
+        );
+        assert_eq!(select_chain(&request, &[]).unwrap_err().status(), 404);
+    }
+
+    #[test]
+    fn handshake_rejects_route_variants_and_queries() {
+        let chains = vec!["paseo".to_owned(), "asset-hub-paseo".to_owned()];
+        for path in [
+            "/rpc/unknown",
+            "/rpc/Paseo",
+            "/rpc/",
+            "/rpc/paseo/",
+            "/rpc/paseo/../asset-hub-paseo",
+            "/rpc/%70aseo",
+            "/rpc/asset-hub-paseo%2F",
+            "/other/paseo",
+            "/rpc/paseo?",
+            "/rpc/paseo?chain=asset-hub-paseo",
+            "/rpc/asset-hub-paseo?chain=paseo",
+        ] {
+            let request = Request::builder().uri(path).body(()).unwrap();
+            assert_eq!(select_chain(&request, &chains).unwrap_err().status(), 404);
+        }
+    }
+
+    #[test]
+    fn handshake_rejects_every_browser_origin_on_configured_routes() {
+        let chains = vec!["paseo".to_owned(), "asset-hub-paseo".to_owned()];
+        for chain in &chains {
+            for origin in ["https://example.com", "file://", "null", ""] {
+                let request = Request::builder()
+                    .uri(format!("/rpc/{chain}"))
+                    .header("Origin", origin)
+                    .body(())
+                    .unwrap();
+                assert_eq!(select_chain(&request, &chains).unwrap_err().status(), 403);
+            }
+        }
+        let request = Request::builder()
+            .uri("/rpc/unknown")
+            .header("Origin", "https://example.com")
+            .body(())
+            .unwrap();
+        assert_eq!(select_chain(&request, &chains).unwrap_err().status(), 404);
+    }
 
     #[tokio::test]
     async fn second_bind_does_not_replace_live_socket() {

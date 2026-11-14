@@ -8,7 +8,7 @@ StartLimitBurst=3
 
 [Service]
 Type=exec
-ExecStart="%h/.local/lib/polkadot-host/polkadot-hostd" --systemd-socket --socket "%t/polkadot-host/rpc.sock" --chain-spec "%h/.local/lib/polkadot-host/paseo.json" --state-dir "%S/polkadot-host"
+ExecStart="%h/.local/lib/polkadot-host/polkadot-hostd" --systemd-socket --socket "%t/polkadot-host/rpc.sock" --chain-spec "%h/.local/lib/polkadot-host/paseo.json" --parachain-spec "%h/.local/lib/polkadot-host/paseo_asset_hub.json" --state-dir "%S/polkadot-host"
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
