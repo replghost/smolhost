@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use polkadot_host::{
     default_socket_path,
@@ -27,16 +27,47 @@ struct Args {
     /// Absolute socket path in a private, user-owned directory.
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Require exactly one systemd-provided Unix listener; never bind a replacement.
+    #[arg(long)]
+    systemd_socket: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let args = Args::parse();
+    // listenfd consumes environment variables. Do this before creating any threads.
+    let inherited = if args.systemd_socket {
+        ensure!(
+            std::env::var("LISTEN_PID").ok().as_deref() == Some(&std::process::id().to_string()),
+            "socket activation requires LISTEN_PID matching this process"
+        );
+        let mut descriptors = listenfd::ListenFd::from_env();
+        ensure!(
+            descriptors.len() == 1,
+            "socket activation requires exactly one listener"
+        );
+        Some(
+            descriptors
+                .take_unix_listener(0)?
+                .context("missing inherited Unix listener")?,
+        )
+    } else {
+        None
+    };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp(None)
         .init();
-    let args = Args::parse();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args, inherited))
+}
+
+async fn run(args: Args, inherited: Option<std::os::unix::net::UnixListener>) -> Result<()> {
     let path = args.socket.map(Ok).unwrap_or_else(default_socket_path)?;
-    let bound = BoundSocket::bind(path.clone())?;
+    let bound = match inherited {
+        Some(listener) => BoundSocket::from_inherited(path.clone(), listener)?,
+        None => BoundSocket::bind(path.clone())?,
+    };
     let (engine, chain) = Engine::new(ipc::read_chain_spec(&args.chain_spec)?)?;
     let chain = Arc::new(chain);
     let permits = Arc::new(Semaphore::new(16));

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=Polkadot light-client RPC socket
+# systemd otherwise unlinks an existing Unix endpoint before binding.
+# A skipped start preserves manual daemons and requires explicit stale-file cleanup.
+ConditionPathExists=!%t/polkadot-host/rpc.sock
+
+[Socket]
+ListenStream=%t/polkadot-host/rpc.sock
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=yes
+Accept=no
+Backlog=16
+
+[Install]
+WantedBy=sockets.target

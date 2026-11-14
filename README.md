@@ -2,7 +2,7 @@
 
 A shared Polkadot light-client service for Linux applications.
 
-**Experimental, unofficial, manual-run spike.** Not security-audited or suitable
+**Experimental, unofficial prototype.** Not security-audited or suitable
 for production funds. Not affiliated with Parity Technologies or the Web3 Foundation.
 
 ## What this spike does
@@ -14,17 +14,18 @@ for production funds. Not affiliated with Parity Technologies or the Web3 Founda
   verified chain storage, plus an opt-in two-process acceptance script.
 - Uses a pinned public Paseo relay-chain specification. No wallet or credentials
   are needed, and no transactions are submitted.
+- Can run as an opt-in systemd user service, with a supervisor-owned Unix socket.
 
-There is no systemd integration, persisted bootstrap state, parachain support,
-browser bridge, TCP listener, signing, or Zenoh integration in this spike. It
-starts from the chain specification on every launch. Desktop and mobile are the
-intended targets; an x86-64 run does not establish AArch64 or phone support.
+There is no persisted bootstrap state, parachain support, browser bridge, TCP
+listener, signing, or Zenoh integration. It starts from the chain specification on
+every launch. Desktop and mobile are the intended targets; an x86-64 run does not
+establish AArch64 or phone support.
 
 ## Build
 
 A Linux environment and a Rust toolchain supporting edition 2024 are required.
-Python 3 is needed only for the acceptance script. The lockfile fixes dependency
-versions, including `smoldot-light` 4.0.0 and its native runtime dependencies.
+Python 3 is needed for the installer and acceptance script. The lockfile fixes
+dependency versions, including `smoldot-light` 4.0.0 and its native runtime dependencies.
 
 ```sh
 cargo build --locked --bins
@@ -33,7 +34,7 @@ cargo build --locked --bins
 Build artifacts go in `target/` unless your local build tooling overrides that
 location. Source and chain state must not be stored in disposable build outputs.
 
-## Run
+## Run manually
 
 Start the daemon in one terminal:
 
@@ -74,9 +75,75 @@ For raw RPC, the CLI streams responses until disconnect, Ctrl-C, or its deadline
 Raw mode does not manage pinned blocks for you; use `probe` for the bounded smoke
 scenario. Both binaries accept `--socket /absolute/private-directory/rpc.sock`.
 The socket directory must be owned by the current user and inaccessible to other
-users. An existing socket is never replaced. Stop the daemon with Ctrl-C or SIGTERM;
-it cancels its sessions and removes its own socket. After an unclean crash, verify
-that no daemon owns the endpoint before manually removing a stale socket.
+users. An existing socket is never replaced by the manual daemon. Stop it with
+Ctrl-C or SIGTERM; it cancels its sessions and removes its own socket. After an
+unclean manual-run crash, verify that no daemon owns the endpoint before manually
+removing a stale socket. Do not run the service and a manual daemon on the same
+path; use `--socket` for an independent experiment.
+
+## Run as a user service
+
+Requires Linux with a running systemd user manager. No root privileges or sudo:
+
+```sh
+python3 scripts/user-service.py install
+systemctl --user enable --now polkadot-host.service
+~/.local/bin/polkadot-host --chain paseo probe --finalizations 3
+```
+
+Build both binaries first. The installer defaults to `target/debug`; use
+`--bin-dir /absolute/build/output` for another build. It copies the binaries and
+Paseo spec into `~/.local/lib/polkadot-host`, links the CLI in `~/.local/bin`, and
+copies the units into `$XDG_CONFIG_HOME/systemd/user` (normally
+`~/.config/systemd/user`). Nothing runs from disposable build outputs.
+
+Installation alone **does not start or enable anything**. The explicit
+`enable --now` command starts the daemon and enables both units for future user
+sessions. For this session only, use `systemctl --user start polkadot-host.service`.
+For on-demand activation instead, enable only `polkadot-host.socket`; the first
+connection starts the daemon, which then stays running.
+
+The socket remains `$XDG_RUNTIME_DIR/polkadot-host/rpc.sock`, mode `0600`, in a
+private `0700` directory. Systemd owns the listener and passes it to the daemon.
+The daemon validates its path, permissions, and ownership and never unlinks an
+inherited endpoint. The socket unit refuses to start over an existing pathname,
+including a manual daemon's listener; inspect the owner before removing stale files.
+
+The daemon restarts after failure, subject to a three-starts-per-minute limit.
+The socket survives daemon restarts, but **existing application sessions do not**:
+clients must reconnect and resubscribe. Every daemon restart also resynchronizes
+from the bundled spec; persistence is not implemented. An active unit or listening
+socket does not establish chain readiness—wait for RPC initialization and real data.
+
+```sh
+systemctl --user status polkadot-host.service polkadot-host.socket
+journalctl --user -u polkadot-host.service -f
+systemctl --user restart polkadot-host.service
+```
+
+To stop it, stop **both** units; leaving the socket running allows connections to
+reactivate the daemon:
+
+```sh
+systemctl --user stop polkadot-host.socket polkadot-host.service
+```
+
+To also disable future startup, use `systemctl --user disable --now
+polkadot-host.socket polkadot-host.service`. This keeps the installation.
+For removal, including stopping and disabling both units:
+
+```sh
+python3 scripts/user-service.py uninstall
+```
+
+The installer refuses conflicting files. Uninstall checks recorded hashes and
+refuses modified installed files before stopping anything; back up/remove or
+restore those modifications first. Unrelated files and systemd drop-ins are left
+alone. For this spike, update by uninstalling and then reinstalling.
+
+The service follows the lifetime of your user manager. This installer does not
+enable lingering, change logout policy, or claim operation during device suspend.
+See systemd's [socket activation documentation](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html).
 
 ## Verify
 
@@ -164,8 +231,21 @@ The initial live acceptance run passed on x86-64 Linux with Rust 1.98.1:
   (`0x96e03c879d31019318d721710d8755939ad26f52eb9d8e4d55c34398659a69f7`).
 - Both sessions were released; the script stopped its temporary daemon.
 
-This proves the manual relay-chain scenario, not service installation, restart
-persistence, mobile compatibility, or production security.
+A subsequent systemd 261 user-manager run verified:
+
+- Socket activation with two concurrent clients and one chain initialization.
+- Graceful daemon restart and automatic recovery after `SIGKILL`, preserving the
+  socket inode and accepting fresh clients afterward.
+- Enable/disable without losing the installation; uninstall while enabled and
+  running; protection of conflicting, modified, and unrelated files.
+- Verified state through block 1,932,779 after installing the final unit layout.
+
+All six offline IPC tests passed, including inherited-listener lifetime and
+permission checks. The test installation was removed afterward. Login/reboot,
+suspend/resume, and mobile behavior were not exercised.
+
+This proves the relay-chain scenario, not restart persistence, mobile
+compatibility, or production security.
 
 ## Development
 
@@ -175,9 +255,8 @@ findings, and contributions are welcome in
 [GitHub issues](https://github.com/replghost/polkadot-host/issues). Explain what
 you changed and tested; do not post secrets or sensitive vulnerability details.
 
-After the manual two-client spike, the next experiments are systemd user-service
-integration, persisted bootstrap state, a parachain, and actual AArch64/mobile
-validation. None are implied by a successful relay-chain run.
+The next experiments are persisted bootstrap state, a parachain, and actual
+AArch64/mobile validation. None are implied by a successful relay-chain run.
 
 ## License
 
