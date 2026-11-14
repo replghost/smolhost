@@ -87,9 +87,12 @@ There are no buildable workspace members, installation instructions, or service
 units yet. Those belong with the working spike, not with a nonfunctional skeleton.
 Commit the resolved Cargo lockfile when the first package is added.
 
-Design discussion and reproducible findings are welcome in
-[GitHub issues](https://github.com/replghost/polkadot-host/issues). Include the
-platform and dependency versions; never include secrets or private chain data.
+Coding agents should follow [AGENTS.md](AGENTS.md). Small fixes and experiments
+do not need a formal proposal.
+
+Questions, findings, and contributions are welcome in
+[GitHub issues](https://github.com/replghost/polkadot-host/issues). Explain what
+you changed and tested; do not post secrets or sensitive vulnerability details.
 
 ## License
 
