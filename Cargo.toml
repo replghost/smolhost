@@ -1,0 +1,11 @@
+[workspace]
+members = []
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/replghost/polkadot-host"
+
+[workspace.dependencies]
+smoldot-light = "=4.0.0"
