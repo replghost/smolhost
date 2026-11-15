@@ -7,28 +7,140 @@ pub mod client;
 mod dag;
 pub use dag::{MAX_BLOCK_BYTES, MAX_BLOCKS, MAX_DAG_OVERHEAD_BYTES, MAX_DEPTH, MAX_FILE_BYTES};
 
-use std::time::Duration;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue};
 use sha2::{Digest, Sha256};
-use tokio::{net::UnixStream, sync::Semaphore};
+use tokio::{net::UnixStream, sync::Semaphore, time::Instant};
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{Bytes, Message},
 };
 
-use crate::engine::{Session, SharedEngine};
+use crate::{
+    discovery::{ContentCapabilities, ContentDeadlines, ContentEndpoint, ContentLimits},
+    engine::{Session, SharedEngine},
+};
 use dag::Walker;
 
+pub const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const ROUTE_PREFIX: &str = "/content/";
 pub const CHUNK_BYTES: usize = 64 * 1024;
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(180);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROL_BYTES: usize = 4096;
 const MAX_UPSTREAM_BYTES: usize = 2 * MAX_BLOCK_BYTES + MAX_CONTROL_BYTES;
-static TRANSFERS: Semaphore = Semaphore::const_new(4);
+const MAX_CONCURRENT_TRANSFERS: usize = 4;
+static TRANSFERS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
+static NEXT_TRANSFER: AtomicU64 = AtomicU64::new(1);
+
+// Retained outside the cancellable work so deadline/disconnect diagnostics keep
+// the last observed stage. No payloads or CIDs are retained here.
+struct Progress {
+    id: u64,
+    began: Instant,
+    phase: &'static str,
+    phase_began: Instant,
+    block_began: Option<Instant>,
+    block: u64,
+    verified_blocks: u64,
+    verified_bytes: u64,
+    sent_bytes: u64,
+}
+
+impl Progress {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            id: NEXT_TRANSFER.fetch_add(1, Ordering::Relaxed),
+            began: now,
+            phase: "await_request",
+            phase_began: now,
+            block_began: None,
+            block: 0,
+            verified_blocks: 0,
+            verified_bytes: 0,
+            sent_bytes: 0,
+        }
+    }
+
+    fn phase(&mut self, phase: &'static str) {
+        self.phase = phase;
+        self.phase_began = Instant::now();
+    }
+
+    fn begin_block(&mut self) {
+        self.block += 1;
+        self.phase("enqueue_block");
+        self.block_began = Some(self.phase_began);
+    }
+
+    fn error(&self, chain: &str, error: anyhow::Error) -> anyhow::Error {
+        error.context(format!("content chain={chain} {self}"))
+    }
+}
+
+impl fmt::Display for Progress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let now = Instant::now();
+        write!(
+            f,
+            "transfer={} phase={} elapsed_ms={} phase_ms={} block={} block_ms={} verified_blocks={} verified_bytes={} sent_bytes={}",
+            self.id,
+            self.phase,
+            (now - self.began).as_millis(),
+            (now - self.phase_began).as_millis(),
+            self.block,
+            self.block_began
+                .map_or(0, |began| (now - began).as_millis()),
+            self.verified_blocks,
+            self.verified_bytes,
+            self.sent_bytes,
+        )
+    }
+}
+
+pub(crate) fn capabilities(chains: &[String]) -> ContentCapabilities {
+    ContentCapabilities {
+        protocol_version: PROTOCOL_VERSION,
+        endpoints: chains
+            .iter()
+            .map(|chain| ContentEndpoint {
+                chain_id: chain.clone(),
+                path: format!("{ROUTE_PREFIX}{chain}"),
+            })
+            .collect(),
+        cid_versions: vec![1],
+        multibases: vec!["base32lower".into()],
+        codecs: vec![0x55, 0x70],
+        hashes: vec![0x12, 0x1b, 0xb220],
+        unixfs_types: vec!["file".into(), "raw".into()],
+        limits: ContentLimits {
+            max_file_bytes: MAX_FILE_BYTES,
+            max_block_bytes: MAX_BLOCK_BYTES as u64,
+            max_blocks: MAX_BLOCKS as u64,
+            max_depth: MAX_DEPTH as u64,
+            max_dag_overhead_bytes: MAX_DAG_OVERHEAD_BYTES,
+            max_chunk_bytes: CHUNK_BYTES as u64,
+            max_control_bytes: MAX_CONTROL_BYTES as u64,
+            max_concurrent_transfers: MAX_CONCURRENT_TRANSFERS as u64,
+            max_connections: crate::ipc::MAX_CONNECTIONS as u64,
+        },
+        deadlines: ContentDeadlines {
+            handshake_ms: crate::ipc::IO_TIMEOUT.as_millis() as u64,
+            request_ms: IO_TIMEOUT.as_millis() as u64,
+            write_ms: IO_TIMEOUT.as_millis() as u64,
+            transfer_ms: TRANSFER_TIMEOUT.as_millis() as u64,
+        },
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,7 +161,10 @@ fn parse_request(text: &str) -> Result<Request> {
         "content request exceeds limit"
     );
     let request: Request = serde_json::from_str(text).context("invalid content request")?;
-    ensure!(request.version == 1, "unsupported content protocol version");
+    ensure!(
+        request.version == PROTOCOL_VERSION,
+        "unsupported content protocol version"
+    );
     ensure!(
         request.max_bytes <= MAX_FILE_BYTES,
         "max_bytes exceeds content limit"
@@ -102,6 +217,7 @@ pub(crate) async fn serve(
     chain: &str,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + TRANSFER_TIMEOUT;
+    let mut progress = Progress::new();
     let (mut sender, mut receiver) = socket.split();
     let request = tokio::time::timeout(IO_TIMEOUT, async {
         loop {
@@ -111,6 +227,7 @@ pub(crate) async fn serve(
                 .context("connection closed before content request")??
             {
                 Message::Text(text) => {
+                    progress.phase("validate_request");
                     return parse_request(&text);
                 }
                 Message::Ping(_) | Message::Pong(_) => (),
@@ -126,17 +243,27 @@ pub(crate) async fn serve(
             // Dropping this entire future on cancellation drops its private Session,
             // which removes the frontend and the upstream Bitswap cancel guard.
             with_cancellation(&mut receiver, async {
-                tokio::time::timeout_at(deadline, transfer(&mut sender, engine, chain, request))
-                    .await
-                    .context("content transfer timed out")
-                    .and_then(|result| result)
+                tokio::time::timeout_at(
+                    deadline,
+                    transfer(&mut sender, engine, chain, request, &mut progress),
+                )
+                .await
+                .context("content transfer timed out")
+                .and_then(|result| result)
             })
             .await
         }
         Err(error) => Err(error),
     };
+    let outcome = match (&result, progress.phase) {
+        (Err(_), _) => "failed",
+        (Ok(()), "completed") => "completed",
+        (Ok(()), _) => "cancelled",
+    };
+    log::debug!("host: content ended chain={chain} outcome={outcome} {progress}");
+    let result = result.map_err(|error| progress.error(chain, error));
     if let Err(error) = &result {
-        let message: String = error.to_string().chars().take(512).collect();
+        let message: String = format!("{error:#}").chars().take(512).collect();
         let _ = send(
             &mut sender,
             Message::Text(
@@ -204,19 +331,24 @@ async fn transfer<S>(
     engine: SharedEngine,
     chain: &str,
     request: Request,
+    progress: &mut Progress,
 ) -> Result<()>
 where
     S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
+    progress.phase("acquire_slot");
     let _permit = TRANSFERS
         .try_acquire()
-        .context("all four content transfer slots are busy")?;
+        .context("all content transfer slots are busy")?;
+    progress.phase("validate_cid");
     let mut walker = Walker::new(&request.cid, request.max_bytes)?;
+    progress.phase("open_session");
     let mut session = Session::open(engine, chain)?;
+    progress.phase("write_started");
     send(
         sender,
         Message::Text(
-            json!({"event":"started", "version":1, "cid":request.cid, "chain":chain})
+            json!({"event":"started", "version":PROTOCOL_VERSION, "cid":request.cid, "chain":chain})
                 .to_string()
                 .into(),
         ),
@@ -224,18 +356,31 @@ where
     .await?;
     let mut digest = Sha256::new();
     while let Some(cid) = walker.next_cid() {
-        let block = fetch_block(&mut session, cid).await?;
-        if let Some(bytes) = walker.accept(block)? {
+        progress.begin_block();
+        log::debug!(
+            "host: content block_start chain={chain} transfer={} block={} cid={cid}",
+            progress.id,
+            progress.block,
+        );
+        let block = fetch_block(&mut session, cid, progress).await?;
+        progress.phase("verify_block");
+        let bytes = walker.accept(block)?;
+        progress.verified_blocks = walker.blocks();
+        progress.verified_bytes = walker.bytes();
+        if let Some(bytes) = bytes {
             digest.update(&bytes);
             let bytes = Bytes::from(bytes);
             for offset in (0..bytes.len()).step_by(CHUNK_BYTES) {
                 let end = (offset + CHUNK_BYTES).min(bytes.len());
+                progress.phase("write_chunk");
                 send(sender, Message::Binary(bytes.slice(offset..end))).await?;
+                progress.sent_bytes += (end - offset) as u64;
             }
         }
     }
     // No live upstream subscription remains: each block waits for streamDone.
     drop(session);
+    progress.phase("write_completed");
     send(
         sender,
         Message::Text(
@@ -247,7 +392,9 @@ where
             .into(),
         ),
     )
-    .await
+    .await?;
+    progress.phase("completed");
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -288,12 +435,8 @@ enum BlockEvent<'a> {
     StreamDone,
 }
 
-async fn upstream_response(session: &mut Session) -> Result<String> {
-    let response = session
-        .responses
-        .next()
-        .await
-        .context("Bitswap frontend closed")?;
+async fn upstream_response(responses: &mut (impl Stream<Item = String> + Unpin)) -> Result<String> {
+    let response = responses.next().await.context("Bitswap frontend closed")?;
     ensure!(
         response.len() <= MAX_UPSTREAM_BYTES,
         "Bitswap response exceeds block limit"
@@ -301,13 +444,26 @@ async fn upstream_response(session: &mut Session) -> Result<String> {
     Ok(response)
 }
 
-async fn fetch_block(session: &mut Session, cid: &str) -> Result<Vec<u8>> {
+async fn fetch_block(session: &mut Session, cid: &str, progress: &mut Progress) -> Result<Vec<u8>> {
     // The method has ONE argument: an array of CIDs, not a flattened CID list.
     session.request(
         json!({"jsonrpc":"2.0", "id":1, "method":"bitswap_unstable_stream", "params":[[cid]]})
             .to_string(),
     )?;
-    let response = upstream_response(session).await?;
+    let responses = futures_util::stream::unfold(&mut session.responses, |responses| async {
+        responses.next().await.map(|response| (response, responses))
+    });
+    futures_util::pin_mut!(responses);
+    receive_block(&mut responses, cid, progress).await
+}
+
+async fn receive_block(
+    responses: &mut (impl Stream<Item = String> + Unpin),
+    cid: &str,
+    progress: &mut Progress,
+) -> Result<Vec<u8>> {
+    progress.phase("await_subscription");
+    let response = upstream_response(responses).await?;
     let reply: RpcReply<'_> =
         serde_json::from_str(&response).context("invalid Bitswap subscription reply")?;
     ensure!(
@@ -327,11 +483,19 @@ async fn fetch_block(session: &mut Session, cid: &str) -> Result<Vec<u8>> {
         "invalid Bitswap subscription ID"
     );
     let mut block = None;
+    progress.phase("await_block");
     loop {
-        let notification = upstream_response(session).await?;
+        let notification = upstream_response(responses).await?;
         if accept_event(&notification, subscription, cid, &mut block)? {
-            return block.context("Bitswap completed without a block");
+            let block = block.context("Bitswap completed without a block")?;
+            log::debug!(
+                "host: content block_received {} block_bytes={}",
+                progress,
+                block.len(),
+            );
+            return Ok(block);
         }
+        progress.phase("await_done");
     }
 }
 
@@ -410,6 +574,30 @@ fn decode_block(value: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_request_bounds_match_enforced_boundaries() {
+        let advertised = capabilities(&[]);
+        let mut request = json!({
+            "version": advertised.protocol_version,
+            "cid": "c",
+            "max_bytes": advertised.limits.max_file_bytes,
+        });
+        assert!(parse_request(&request.to_string()).is_ok());
+        request["max_bytes"] = json!(advertised.limits.max_file_bytes + 1);
+        assert!(parse_request(&request.to_string()).is_err());
+        request["max_bytes"] = json!(0);
+        let mut text = request.to_string();
+        text.extend(std::iter::repeat_n(
+            ' ',
+            advertised.limits.max_control_bytes as usize - text.len(),
+        ));
+        assert!(parse_request(&text).is_ok());
+        text.push(' ');
+        assert!(parse_request(&text).is_err());
+        request["version"] = json!(advertised.protocol_version + 1);
+        assert!(parse_request(&request.to_string()).is_err());
+    }
 
     fn event(result: serde_json::Value) -> String {
         json!({"jsonrpc":"2.0", "method":"bitswap_unstable_streamEvent", "params":{"subscription":"s", "result":result}}).to_string()
@@ -550,5 +738,105 @@ mod backpressure_tests {
             .unwrap();
         assert!(writes.load(Ordering::SeqCst) > 0);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use futures_util::{FutureExt, stream};
+
+    fn reply() -> String {
+        json!({"jsonrpc":"2.0", "id":1, "result":"s"}).to_string()
+    }
+
+    fn event(result: serde_json::Value) -> String {
+        json!({
+            "jsonrpc":"2.0", "method":"bitswap_unstable_streamEvent",
+            "params":{"subscription":"s", "result":result},
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn upstream_timeout_preserves_stage_and_original_error() {
+        for received_block in [false, true] {
+            let mut messages = vec![reply()];
+            if received_block {
+                messages.push(event(json!({
+                    "event":"streamItem", "cid":"c", "value":"0x0102",
+                })));
+            }
+            messages.push(event(json!({
+                "event":"streamItemError", "cid":"c", "code":-32811,
+                "message":"Request timeout.",
+            })));
+            let mut progress = Progress::new();
+            progress.begin_block();
+            let error = receive_block(&mut stream::iter(messages), "c", &mut progress)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                progress.phase,
+                if received_block {
+                    "await_done"
+                } else {
+                    "await_block"
+                }
+            );
+            // Receipt of bytes is not CID verification or delivery to the caller.
+            assert_eq!(progress.verified_blocks, 0);
+            assert_eq!(progress.verified_bytes, 0);
+            assert_eq!(progress.sent_bytes, 0);
+            let error = progress.error("test-chain", error);
+            assert!(error.root_cause().to_string().contains("-32811"));
+            let public_error = format!("{error:#}");
+            assert!(public_error.contains("Request timeout."));
+            assert!(public_error.contains(progress.phase));
+        }
+    }
+
+    #[test]
+    fn cancelled_wait_retains_the_last_stage_without_claiming_completion() {
+        let item = event(json!({"event":"streamItem", "cid":"c", "value":"0x0102"}));
+        for (messages, phase) in [
+            (vec![], "await_subscription"),
+            (vec![reply()], "await_block"),
+            (vec![reply(), item], "await_done"),
+        ] {
+            let mut responses = stream::iter(messages).chain(stream::pending());
+            let mut progress = Progress::new();
+            progress.begin_block();
+            assert!(
+                receive_block(&mut responses, "c", &mut progress)
+                    .now_or_never()
+                    .is_none()
+            );
+            assert_eq!(progress.phase, phase);
+            assert_eq!(progress.block, 1);
+            assert_eq!(progress.verified_blocks, 0);
+            assert_eq!(progress.sent_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnosed_stream_still_requires_done_and_rejects_premature_eof() {
+        let item = event(json!({"event":"streamItem", "cid":"c", "value":"0x0102"}));
+        let mut progress = Progress::new();
+        progress.begin_block();
+        let mut incomplete = stream::iter(vec![reply(), item.clone()]);
+        assert!(
+            receive_block(&mut incomplete, "c", &mut progress)
+                .await
+                .is_err()
+        );
+        assert_eq!(progress.phase, "await_done");
+        let mut complete = stream::iter(vec![reply(), item, event(json!({"event":"streamDone"}))]);
+        assert_eq!(
+            receive_block(&mut complete, "c", &mut progress)
+                .await
+                .unwrap(),
+            [1, 2],
+        );
     }
 }

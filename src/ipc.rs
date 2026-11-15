@@ -26,7 +26,8 @@ use crate::{
     engine::{Session, SharedEngine},
 };
 
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_CONNECTIONS: usize = 16;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -217,7 +218,7 @@ fn select_route(request: &Request, chains: &[String]) -> std::result::Result<Rou
     let selected = if request.uri().path() == DISCOVERY_PATH {
         Some(Route::Host)
     } else {
-        [("/rpc/", false), ("/content/", true)]
+        [("/rpc/", false), (crate::content::ROUTE_PREFIX, true)]
             .into_iter()
             .find_map(|(prefix, content)| {
                 request
@@ -367,6 +368,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discovered_content_endpoints_match_every_configured_route_and_keep_origin_gate() {
+        let chains = vec![
+            "relay".to_owned(),
+            "asset-hub".to_owned(),
+            "bulletin".to_owned(),
+            "people".to_owned(),
+        ];
+        let info = HostInfo {
+            protocol_version: crate::discovery::PROTOCOL_VERSION,
+            read_only: true,
+            chains: chains
+                .iter()
+                .enumerate()
+                .map(|(index, chain)| crate::discovery::ChainInfo {
+                    id: chain.clone(),
+                    name: chain.clone(),
+                    genesis_hash: format!("0x{index:064x}"),
+                    relay_chain: (index != 0).then(|| chains[0].clone()),
+                    para_id: (index != 0).then_some(1000 + index as u32),
+                    properties: json!({}),
+                    rpc_methods: Vec::new(),
+                })
+                .collect(),
+            content: Some(crate::content::capabilities(&chains)),
+        };
+        let catalog = HostCatalog::new(&info).unwrap();
+        let response: Value = serde_json::from_str(
+            &host_response(
+                r#"{"jsonrpc":"2.0","id":1,"method":"host_discover"}"#,
+                &catalog,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let advertised: HostInfo = serde_json::from_value(response["result"].clone()).unwrap();
+        let content = advertised.content.unwrap();
+        assert_eq!(content.endpoints.len(), advertised.chains.len());
+        for (index, (endpoint, chain)) in
+            content.endpoints.iter().zip(&advertised.chains).enumerate()
+        {
+            assert_eq!(endpoint.chain_id, chain.id);
+            let request = Request::builder().uri(&endpoint.path).body(()).unwrap();
+            assert_eq!(
+                select_route(&request, &chains).unwrap(),
+                Route::Content(index)
+            );
+            assert_eq!(select_route(&request, &[]).unwrap_err().status(), 404);
+            for origin in ["https://example.com", "null", ""] {
+                let request = Request::builder()
+                    .uri(&endpoint.path)
+                    .header("Origin", origin)
+                    .body(())
+                    .unwrap();
+                assert_eq!(select_route(&request, &chains).unwrap_err().status(), 403);
+            }
+        }
+    }
+
+    #[test]
     fn content_route_is_private_exact_and_does_not_expose_bitswap_rpc() {
         let chains = vec!["bulletin".to_owned()];
         let request = Request::builder()
@@ -406,6 +466,7 @@ mod tests {
             protocol_version: crate::discovery::PROTOCOL_VERSION,
             read_only: true,
             chains: Vec::new(),
+            content: None,
         })
         .unwrap()
     }
@@ -574,6 +635,7 @@ mod tests {
                 properties: json!({"large": "x".repeat(MAX_RESPONSE_BYTES)}),
                 rpc_methods: Vec::new(),
             }],
+            content: None,
         };
         assert!(HostCatalog::new(&info).is_err());
     }

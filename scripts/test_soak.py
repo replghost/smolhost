@@ -225,6 +225,66 @@ class MultiChainTests(unittest.TestCase):
             driver.progress_file.close()
 
 
+class ExitObservationTests(unittest.TestCase):
+    def driver(self, phase="done", role="churn"):
+        args = SimpleNamespace(chain=["a"], expected_genesis=[soak.GENESIS],
+                               churn_secs=60, duration_secs=180, stall_secs=240,
+                               output_dir=Path("/unused"))
+        driver = soak.Soak(args)
+        driver.started = 0
+        driver.progress_file = io.StringIO()
+        self.addCleanup(driver.selector.close)
+        self.addCleanup(driver.progress_file.close)
+        process = SimpleNamespace(returncode=None)
+        process.poll = lambda: process.returncode
+        evidence = soak.Evidence(soak.GENESIS, 1)
+        evidence.phase = phase
+        child = soak.Child("churn-test", role, process, 100, evidence,
+                           chain="a", open_streams=0)
+        driver.children[child.name] = child
+        return driver, child
+
+    def test_verified_eof_before_exit_is_not_failure_or_early_success(self):
+        driver, child = self.driver()
+        with patch.object(soak.time, "monotonic", return_value=101):
+            driver.check_children()
+            self.assertEqual(driver.churn_completed, 0)
+            self.assertIn(child.name, driver.children)
+            child.process.returncode = 0
+            driver.check_children()
+        self.assertEqual(driver.churn_completed, 1)
+        self.assertNotIn(child.name, driver.children)
+        self.assertEqual(driver.exit_codes["churn:0"], 1)
+
+    def test_verified_eof_cannot_hide_a_process_that_never_exits(self):
+        driver, child = self.driver()
+        with patch.object(soak.time, "monotonic", return_value=101):
+            driver.check_children()
+        with patch.object(soak.time, "monotonic", return_value=106):
+            with self.assertRaisesRegex(soak.SoakFailure, "five seconds"):
+                driver.check_children()
+        self.assertEqual(driver.churn_completed, 0)
+
+    def test_eof_requires_completion_and_a_successful_exit(self):
+        driver, _ = self.driver(phase="storage")
+        with self.assertRaisesRegex(soak.SoakFailure, "without verified"):
+            driver.check_children()
+        driver, child = self.driver()
+        with patch.object(soak.time, "monotonic", return_value=101):
+            driver.check_children()
+            child.process.returncode = 1
+            with self.assertRaisesRegex(soak.SoakFailure, "code 1"):
+                driver.check_children()
+        self.assertEqual(driver.churn_completed, 0)
+
+    def test_continuous_processes_do_not_get_churn_eof_grace(self):
+        for role in ("daemon", "continuous"):
+            with self.subTest(role=role):
+                driver, _ = self.driver(role=role)
+                with self.assertRaisesRegex(soak.SoakFailure, "without verified"):
+                    driver.check_children()
+
+
 class OutputTests(unittest.TestCase):
     def test_tail_logs_rotate_at_fixed_bound(self):
         with tempfile.TemporaryDirectory() as root, patch.object(soak, "LOG_BYTES", 64):

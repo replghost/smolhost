@@ -119,7 +119,7 @@ async fn run(args: Args, inherited: Option<std::os::unix::net::UnixListener>) ->
         _ => None,
     };
     let chains = Arc::new(chains);
-    let permits = Arc::new(Semaphore::new(16));
+    let permits = Arc::new(Semaphore::new(ipc::MAX_CONNECTIONS));
     let mut tasks = JoinSet::new();
     let mut terminate = signal(SignalKind::terminate())?;
     log::info!("host: listening socket={}", path.display());

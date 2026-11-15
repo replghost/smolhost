@@ -244,6 +244,8 @@ class ContentSoak:
     def spawn(self, role, command):
         environment = os.environ.copy()
         environment.update(RUST_LOG="info", RUST_LOG_STYLE="never")
+        if role == "daemon" and self.args.content_debug:
+            environment["RUST_LOG"] = "info,smolhost::content=debug"
         for key in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES", "NOTIFY_SOCKET"):
             environment.pop(key, None)
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -295,7 +297,7 @@ class ContentSoak:
     def line(self, child, raw):
         self.logs[child.role].append(raw)
         if child.role == "daemon":
-            if b"host: session ended: content write timed out" in raw:
+            if b"host: session ended: " in raw and b"content write timed out" in raw:
                 self.daemon_timeouts += 1
             if not self.stopping and (b"panicked at" in raw or b" ERROR " in raw):
                 raise Failure("daemon error; see private daemon.log")
@@ -545,6 +547,8 @@ def arguments(argv=None):
     parser.add_argument("--sample-secs", type=soak.positive_integer, default=5)
     parser.add_argument("--interval-secs", type=soak.positive_integer, default=30)
     parser.add_argument("--full-every", type=soak.positive_integer, default=8)
+    parser.add_argument("--content-debug", action="store_true",
+                        help="Record per-block diagnostics, including requested CIDs, in private logs")
     parser.add_argument("--churn-cid", help="Optional smaller public fixture; all four churn pins required")
     parser.add_argument("--churn-sha256")
     parser.add_argument("--churn-bytes", type=soak.positive_integer)

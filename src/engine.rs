@@ -172,6 +172,7 @@ pub async fn catalog(engine: &SharedEngine, chains: &[String]) -> Result<HostInf
         protocol_version: PROTOCOL_VERSION,
         read_only: true,
         chains: entries,
+        content: Some(crate::content::capabilities(chains)),
     })
 }
 

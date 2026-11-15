@@ -542,7 +542,12 @@ mod tests {
                 let _ = peer.next().await;
             });
             if version == PROTOCOL_VERSION {
-                assert_eq!(result.unwrap().protocol_version, PROTOCOL_VERSION);
+                let host = result.unwrap();
+                assert_eq!(host.protocol_version, PROTOCOL_VERSION);
+                assert!(
+                    host.content.is_none(),
+                    "legacy discovery must not invent content support"
+                );
             } else {
                 assert!(
                     result
@@ -552,6 +557,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_discovery_without_content_still_allows_chain_rpc() {
+        let (_directory, path, listener) = listener();
+        let ((), ()) = tokio::join!(
+            async {
+                let host = discover(&path).await.unwrap();
+                assert!(host.content.is_none());
+                let mut rpc = connect_chain(&path, &host.chains[0]).await.unwrap();
+                assert_eq!(
+                    rpc.call("chainSpec_v1_properties", json!([]))
+                        .await
+                        .unwrap(),
+                    json!({"tokenSymbol":"UNIT"})
+                );
+                rpc.close().await.unwrap();
+            },
+            async {
+                let mut peer = accept(&listener, DISCOVERY_PATH).await;
+                let discovery = request(&mut peer).await;
+                send(
+                    &mut peer,
+                    json!({
+                        "jsonrpc":"2.0", "id":discovery["id"], "result":{
+                            "protocol_version":PROTOCOL_VERSION, "read_only":true,
+                            "chains":[{
+                                "id":"legacy", "name":"Legacy", "genesis_hash":"0x11",
+                                "relay_chain":null, "para_id":null, "properties":{},
+                                "rpc_methods":["chainSpec_v1_genesisHash","chainSpec_v1_properties"]
+                            }]
+                        }
+                    }),
+                )
+                .await;
+                let _ = peer.next().await;
+                let mut peer = accept(&listener, "/rpc/legacy").await;
+                let genesis = request(&mut peer).await;
+                send(
+                    &mut peer,
+                    json!({"jsonrpc":"2.0","id":genesis["id"],"result":"0x11"}),
+                )
+                .await;
+                let properties = request(&mut peer).await;
+                assert_eq!(properties["method"], "chainSpec_v1_properties");
+                send(
+                    &mut peer,
+                    json!({"jsonrpc":"2.0","id":properties["id"],"result":{"tokenSymbol":"UNIT"}}),
+                )
+                .await;
+                let _ = peer.next().await;
+            },
+        );
     }
 
     #[tokio::test]

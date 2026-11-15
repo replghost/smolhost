@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Fetch a CID through the local native Bitswap route; never overwrite output.
+//! Discover and fetch a CID through an advertised local route; never overwrite output.
 //! CID integrity does not establish chain inclusion, authorship, or safe contents.
 
 use std::{path::PathBuf, time::Duration};
@@ -18,6 +18,7 @@ struct Args {
     /// Private smolhost Unix socket (defaults to $XDG_RUNTIME_DIR/smolhost/rpc.sock).
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Configured chain whose advertised content capability must support this CID.
     #[arg(long, default_value = "next-bulletin-paseo")]
     chain: String,
     /// CIDv1 base32 raw or UnixFS DAG-PB file root.
@@ -28,6 +29,7 @@ struct Args {
     output: PathBuf,
     #[arg(long, default_value_t = MAX_FILE_BYTES)]
     max_bytes: u64,
+    /// Total discovery, download and publication deadline; server bounds can tighten it.
     #[arg(long, default_value_t = 180)]
     timeout_secs: u64,
 }
@@ -43,6 +45,8 @@ async fn main() -> Result<()> {
         max_bytes: args.max_bytes,
         timeout: Duration::from_secs(args.timeout_secs),
     };
+    // The reusable client negotiates capabilities on this same authenticated socket
+    // before opening the advertised content path or creating a partial output.
     let receipt = tokio::select! {
         biased;
         interrupted = tokio::signal::ctrl_c() => {

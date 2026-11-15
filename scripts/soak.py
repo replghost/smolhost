@@ -265,6 +265,7 @@ class Child:
     evidence: Evidence = None
     chain: str = None
     open_streams: int = 2
+    output_closed_at: float = None
     stop_requested: bool = False
     recorded: bool = False
 
@@ -483,9 +484,17 @@ class Soak:
         for child in list(self.children.values()):
             code = child.process.poll()
             if code is None:
+                now = time.monotonic()
                 if child.open_streams == 0:
-                    raise SoakFailure(child.name + " closed output while still running")
-                if child.role == "churn" and time.monotonic() - child.started > self.args.stall_secs:
+                    if child.role != "churn" or child.evidence.phase != "done":
+                        raise SoakFailure(child.name + " closed output without verified churn completion")
+                    # Pipe EOF can precede waitpid's exit notification. Only a
+                    # fully verified short-lived client gets a bounded grace.
+                    if child.output_closed_at is None:
+                        child.output_closed_at = now
+                    elif now - child.output_closed_at >= 5:
+                        raise SoakFailure(child.name + " did not exit within five seconds of output EOF")
+                if child.role == "churn" and now - child.started > self.args.stall_secs:
                     raise SoakFailure(child.name + " exceeded churn deadline")
                 continue
             if child.role != "churn" or code != 0:

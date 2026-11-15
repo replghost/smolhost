@@ -229,6 +229,43 @@ transport API, not runtime pallets, contracts, personhood availability or finali
 state readiness. Use chain RPC and real verified reads for those checks. Discovery
 is not an independent trust source, a browser bridge or a Product SDK provider.
 
+### Content capability discovery
+
+`HostInfo.content` is an optional `ContentCapabilities` descriptor. Discovery
+remains protocol version 1: absence means content retrieval is unavailable, not
+permission to guess a route. Older hosts can still serve ordinary chain RPC.
+The content protocol has its own `protocol_version`.
+
+- `endpoints` maps each configured `chain_id` to its actual local `path`.
+  This includes the relay and does not claim those chains are Bulletin.
+- `cid_versions`, `multibases`, `codecs`, `hashes` and `unixfs_types` advertise
+  accepted formats. Codec/hash entries are numeric multicodec/multihash codes;
+  the current multibase label is `base32lower`.
+- `limits` contains `max_file_bytes`, `max_block_bytes`, `max_blocks`, `max_depth`,
+  `max_dag_overhead_bytes`, `max_chunk_bytes`, `max_control_bytes`,
+  `max_concurrent_transfers` and `max_connections`. Byte fields use bytes;
+  connections are the global budget across all routes, not extra content slots.
+- `deadlines` contains `handshake_ms`, `request_ms`, `write_ms` and `transfer_ms`.
+  Values come from the same constants used for server enforcement.
+
+The complete typed schema is in [`src/discovery.rs`](src/discovery.rs).
+`smolhost chains` prints it without requiring chain synchronization.
+These capabilities describe support, not peer readiness or content availability.
+
+`content::client::fetch` and `fetch-blob` discover before downloading. They reject
+missing/unsupported capabilities, ambiguous endpoints, unsafe paths and incompatible
+framing/DAG limits before opening a content session or creating partial output.
+The selected path stays on the same authenticated Unix socket; there is no guessed
+endpoint, remote fallback or automatic retry. Compatible extra advertised formats
+do not prevent using an already-supported format.
+
+The requested byte allowance is reduced to the server's advertised file limit;
+stricter count, frame/control and deadline limits also apply. Advertised limits
+never relax the client's local safety bounds. Discovery, transfer and file sync
+share the caller's total timeout; the advertised transfer deadline can tighten it.
+Update the daemon when a new client reports that an older host does not advertise
+content retrieval, rather than bypassing discovery.
+
 ## Read the application profile
 
 Build and run a separate application against the default/manual Next v2 profile:
@@ -344,6 +381,42 @@ The adapter uses the pinned smoldot
 internally; it is not part of the public RPC allowlist. The bounded file walker
 supports the format produced by Bulletin's public
 [UnixFS DAG builder](https://github.com/paritytech/polkadot-bulletin-chain/blob/ec88c0f52ee4a09213cc0cc105390a190cd41568/sdk/rust/src/dag.rs).
+
+### Content diagnostics
+
+Failures retain the upstream cause and add the chain, a process-local `transfer`
+ID, the last observed `phase`, and elapsed milliseconds for the transfer, current
+phase and current block. `block` is a one-based traversal occurrence (zero before
+the first request). `verified_blocks` and `verified_bytes` describe accepted DAG
+progress; `sent_bytes` counts successful local WebSocket writes, not client
+receipt or durable publication. Partial progress never establishes a complete file.
+
+The upstream stages distinguish `await_subscription`, `await_block` and
+`await_done`. In particular, receiving block bytes does not imply that the
+subscription completed. Verification and output stalls have separate stages,
+including `verify_block` and `write_chunk`. Cancellation retains the last stage
+without claiming completion. Error messages remain bounded human-readable text,
+not a machine-stable diagnostic schema.
+
+For per-block start/receive records and completed/cancelled/failed outcomes,
+start a diagnostic daemon with `RUST_LOG=info,smolhost::content=debug`, or add
+`--content-debug` to the content soak command below. Debug start records include
+the requested CID; no block payloads are logged by these records. Treat logs as
+private: CIDs can disclose what an application requested, and upstream errors
+may contain additional context. Debug logging is off by default.
+
+For upstream peer-selection evidence, add
+`bitswap-service-next-bulletin-paseo=trace` to the diagnostic daemon's `RUST_LOG`.
+These records include Have responses, block requests, payload-receipt metadata
+and peer IDs. Keep them private too. The content harness sets its own log filter;
+`--content-debug` alone enables host diagnostics, not upstream trace records.
+
+The pinned [upstream implementation](https://github.com/paritytech/smoldot/blob/6aaa2a8e550f208b3d2182b411c99219680121e0/light-base/src/bitswap_service.rs)
+starts a 10-second per-CID timer after a successful Have broadcast. An upstream
+`-32811` timeout is distinct from the daemon's transfer deadline and local writer
+timeout. `await_block` alone cannot distinguish waiting for a Have response from
+waiting for the selected peer's block, or establish the network cause. There are
+still no automatic retries or deadline extensions.
 
 ## Native balance application
 
@@ -639,6 +712,11 @@ Missing summary after power loss
 or SIGKILL is not a pass. Use immutable binaries for a run so later rebuilds do
 not change its periodically launched clients.
 
+Short-lived churn clients may close their pipes just before their process exit is
+observable. After verified protocol completion, the harness allows at most five
+seconds for a zero exit; EOF alone never counts as success. Missing completion,
+nonzero exits, hangs and closed output from continuous processes still fail.
+
 Measurements cover the daemon process: resident memory (RSS), CPU time, threads
 and open file descriptors. CPU `100%` means one full logical core, not the whole
 machine. Compare cold-start and established-sync periods separately. A rising
@@ -769,6 +847,106 @@ checkpoint. Chain-spec/checkpoint updates need explicit provenance and review.
 
 Verified on x86-64 Linux with Rust 1.98.1 and systemd 261.
 
+### Sustained diagnostics with the default allocator
+
+A subsequent isolated run reused the verified diagnostic binaries with default
+allocator settings, two concurrent large-file consumers and a one-second pause
+between pairs. Every download used the same independently pinned file. A
+task-local launcher added upstream Bitswap tracing alongside content debug logs;
+no daemon code, retries, deadlines or production configuration changed. The
+temporary scope retained the 1 GiB/no-swap safety limit.
+
+| Measurement | Observed |
+| --- | --- |
+| Workload after finalized readiness, including quiet tail | 900 seconds |
+| Independently verified downloads | 248, in 124 concurrent pairs |
+| Unexpected failures / read errors / timeouts | 0 / 0 / 0 |
+| Partial cancellation / deliberate writer timeout | 1 / 1, each followed by recovery |
+| Sampled peak daemon RSS | 395.8 MiB |
+| Post-warmup active RSS, first to last | 330.2 to 395.8 MiB |
+| Last three active minutes' sampled RSS, first to last | 390.3 to 395.8 MiB |
+| Post-warmup active CPU, one core = 100% | 12.16% average |
+| Quiet-tail CPU, one core = 100% | 0.51% average |
+
+After the final download, RSS changed by only 8 KiB across 170 sampled quiet
+seconds. It still grew under late active load: neither this quiet plateau nor
+the safety limit establishes a memory ceiling or absence of leaks. Trace logging
+and live network conditions also prevent a controlled performance comparison
+with earlier runs.
+
+The daemon stopped cleanly, removed its socket and left no partial files.
+Bounded, rotated logs retained correlated Have responses, selected-peer block
+requests and payload-receipt metadata; they are a suffix, not a complete audit
+of every transfer. The earlier upstream timeout did not recur and remains
+unexplained. This is a passing 15-minute qualification run, not long-term or
+mobile qualification. The separate six-hour chain-read baseline was still
+active at the final check, with no completed result claimed. Raw evidence and
+retained inputs remain outside the public repository.
+
+### Content timeout diagnostics
+
+All 35 focused Rust content tests passed, including preservation of upstream
+timeout errors and the last stage when a pending response future is cancelled.
+The 19 offline content-harness tests also passed; live writer-timeout recognition
+was checked after adding contextual error messages.
+
+An isolated live diagnostic scenario verified eight large-file downloads in four
+concurrent pairs, partial cancellation, a deliberate nonreader writer timeout,
+and recovery after each failure/cancellation case. Debug records correlated
+requests, stages and byte counts; the daemon exited zero and removed its socket.
+
+The unpublished-CID request returned `-32810` (no connected peers have the CID)
+after 106 ms, with `phase=await_block`, one request attempt and no published or
+remaining partial output. The throwaway check initially failed because it
+incorrectly expected a timeout; the retained evidence was then evaluated against
+the actual NotFound result without repeating network traffic. This verifies
+diagnostic propagation, not reproduction or resolution of the earlier `-32811`
+timeouts, and is not an endurance pass. Raw evidence remains private.
+
+### Capability negotiation
+
+Verified on 2026-11-14 with 57 focused release tests and an actual isolated daemon.
+`/host` advertised the four configured content endpoints and enforced format/limit/
+deadline values. The external consumer negotiated the Bulletin endpoint and saved
+the independently pinned 10,493,449-byte file with its matching receipt and digest.
+An unknown chain failed without output. Against the retained older daemon, ordinary
+discovery still worked but the new content consumer rejected the missing capability
+before opening a content session; it did not fall back to a guessed path.
+Both temporary daemons stopped cleanly and removed their sockets.
+
+### Chain-read soak failure and restart
+
+The original requested six-hour classic Paseo relay/Asset Hub run **failed after
+544 seconds of observed workload**. All nine completed churn probes exited zero,
+but the harness treated output EOF before observable process exit as a failure.
+Neither an auto-collected systemd unit nor its displayed inactive state establishes
+a successful run; the failed JSON summary is authoritative.
+
+The repaired harness grants only fully verified churn clients a five-second
+exit-observation grace. Its 22 offline tests passed, including zero/nonzero exit,
+missing completion and hung-process regressions. A separate 90-second live run
+completed 15 churn probes and shut down cleanly. A new supervised six-hour run
+was started with retained immutable baseline binaries and the repaired harness.
+The replacement run completed the full six-hour workload on 2026-11-15. Its saved
+summary reports success, all 359 short-lived consumers exited zero, and the daemon
+saved its final checkpoint and exited zero. The continuous consumer's SIGTERM at
+the requested end was intentional, not an unexpected failure.
+
+| Measurement | Observed |
+| --- | --- |
+| Verified storage reads | 11,398 |
+| Finalized notifications | 11,038 |
+| Successful churn consumers | 359 / 359 |
+| Steady average daemon CPU, one core = 100% | 0.55% |
+| Sampled peak / final daemon RSS | 173.9 / 106.9 MiB |
+| Checkpoint-save markers, including shutdown | 361 |
+
+This qualifies the retained classic Paseo relay/Asset Hub chain-read baseline,
+not six hours of the four-chain profile, Bulletin downloads or mobile operation.
+RSS ended below its peak; the run does not establish leak freedom or a memory
+ceiling. The completed JSON summary, not the subsequently absent transient unit,
+is the result authority. Raw evidence remains private.
+
 ### Native Bulletin retrieval
 
 On 2026-11-14, an isolated release daemon with the three-chain application profile
@@ -825,6 +1003,39 @@ retained memory or prove the absence of leaks under sustained large-file traffic
 The harness completed cleanup without forced kills or shutdown failures; the
 separate original chain-read soak was untouched. Raw evidence stays outside the
 public repository. This is prototype qualification, not a production memory bound.
+
+### Sustained large-file memory investigation
+
+Two further runs used identical retained `c5d90ea` release binaries, the four-chain
+profile, two concurrent consumers and the same verified 10,493,449-byte file for
+every download. Pairs were separated by one second. Both requested 900 seconds,
+including a final quiet period, inside separate 1 GiB/no-swap transient scopes.
+Only the second run set the process-local glibc option `MALLOC_ARENA_MAX=2`.
+Production configuration was unchanged.
+
+| Measurement | Default allocator | Two arenas |
+| --- | ---: | ---: |
+| Observed workload (seconds) | 370.9, failed | 900.0, passed |
+| Verified downloads | 88 | 198 |
+| Sampled peak daemon RSS (MiB) | 349.9 | 160.4 |
+| Kernel lifetime RSS high-water mark (MiB) | 349.9 | 163.6 |
+| RSS at first sample after 88 verified downloads (MiB) | 349.9 | 155.0 |
+| CPU in the post-warmup matched-count window (% of one core) | 10.4 | 11.8 |
+
+The default run stopped because both final consumers received upstream Bitswap
+request timeouts; it was not killed by the memory limit. The cause of those
+timeouts remains undetermined. That run is a failed stability result, regardless
+of its successful earlier downloads or clean daemon shutdown.
+
+The two-arena run verified every started download, recovered after deliberate
+cancellation and nonreader tests, and completed cleanup successfully. Its final
+RSS remained 156.1 MiB over 170 sampled seconds after the last completed download.
+
+[INFERENCE] The matched-count memory difference supports allocator retention as
+a contributor, not proof of leak freedom. These public-network runs partly
+overlapped and have unequal durations; their CPU figures are not a controlled
+performance benchmark. Keep allocator tuning experimental pending longer,
+repeatable concurrency and mobile measurements. Raw evidence remains private.
 
 ### Paseo Next v2 application profile
 
