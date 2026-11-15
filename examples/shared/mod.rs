@@ -5,6 +5,9 @@
 
 pub mod metadata;
 
+#[cfg(test)]
+mod tests;
+
 use std::{
     collections::{HashSet, VecDeque},
     time::Duration,
@@ -17,6 +20,24 @@ use smolhost::client::RpcClient;
 pub const CODE_KEY: &str = "0x3a636f6465";
 pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PINS: usize = 128;
+
+/// Interrupted work; the caller decides whether to open a new session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interruption {
+    OperationInaccessible,
+    FollowStopped,
+}
+
+impl std::fmt::Display for Interruption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::OperationInaccessible => "verified chain operation inaccessible",
+            Self::FollowStopped => "chainHead follow stopped",
+        })
+    }
+}
+
+impl std::error::Error for Interruption {}
 
 pub struct Session {
     client: RpcClient,
@@ -124,7 +145,7 @@ impl Session {
             self.pinned.clear();
             self.pending.clear();
             self.obsolete.clear();
-            bail!("chainHead follow stopped; no retry is attempted");
+            return Err(Interruption::FollowStopped.into());
         }
         Ok(event)
     }
@@ -210,7 +231,10 @@ impl Session {
             self.check_operation(&event)?;
             if matches!(kind, "operationInaccessible" | "operationError") {
                 self.operation = None;
-                bail!("verified chain operation failed (no retry): {event}");
+                if kind == "operationInaccessible" {
+                    return Err(Interruption::OperationInaccessible.into());
+                }
+                bail!("verified chain operation failed: {event}");
             }
             return Ok(event);
         }

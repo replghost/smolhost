@@ -237,7 +237,12 @@ impl RpcClient {
             .connection
             .receive_sized()
             .await?
-            .context("daemon disconnected before RPC completed")?;
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "daemon disconnected before RPC completed",
+                )
+            })?;
         ensure!(
             value.is_object() && value["jsonrpc"] == "2.0",
             "invalid JSON-RPC envelope: {value}"
@@ -426,6 +431,26 @@ mod tests {
         }
         assert!(client.connection.receive_json().await.is_err());
         assert!(client.connection.send_json(&json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn graceful_disconnect_is_typed_and_requires_a_new_client() {
+        let (mut client, mut peer) = pair().await;
+        tokio::join!(
+            async {
+                let error = client.call("read", json!([])).await.unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                );
+                assert!(client.call("later", json!([])).await.is_err());
+                assert!(client.next_notification().await.is_err());
+            },
+            async {
+                request(&mut peer).await;
+                peer.close(None).await.unwrap();
+            },
+        );
     }
 
     #[tokio::test]

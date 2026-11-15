@@ -20,7 +20,7 @@ and the Web3 Foundation.
 - Saves relay bootstrap checkpoints every 60 seconds and on clean shutdown.
 - Discovers configured chains and read-only RPC capabilities over `/host`.
 - Provides a reusable native Rust client; the CLI uses the same adapter.
-- Includes a separate native-balance application example using the public client.
+- Includes separate native-balance and bounded-recovery application examples.
 - Streams CID-verified Bulletin files over a separate content route, with a native
   download client that publishes only complete files without overwriting paths.
 - Provides an opt-in endurance harness for finalized-read stability and Linux
@@ -469,6 +469,70 @@ up to two additional seconds. Errors and Ctrl-C exit unsuccessfully, without
 automatic reconnect/resubscribe. Treat this as a small fail-closed example, not
 a production payment monitor.
 
+## Application-level recovery
+
+`examples/watch-recovering.rs` is a separate read-only consumer of finalized
+`System.Number` on the independently pinned **Paseo Next Bulletin** chain. Use
+the default [user-service profile](#run-as-a-user-service), or a manual daemon
+configured with that chain. It is deliberately a state-snapshot example, not an
+event indexer or payment monitor.
+
+```sh
+cargo build --locked --release --example watch-recovering
+./target/release/examples/watch-recovering --snapshots 10 --timeout-secs 300
+```
+
+`--socket PATH` selects another local daemon. Recovery belongs to this application:
+the daemon, `RpcClient`, balance watcher and app-profile reader do not acquire
+automatic retry loops.
+
+- Every replacement session rediscovers the route, checks its genesis, subscribes
+  again and reads verified finalized storage. Transport loss, stopped follows,
+  `operationInaccessible` and bounded step timeouts can trigger recovery.
+- `--max-recoveries 8` is a **lifetime** budget, not reset by a successful
+  subscription or snapshot. Delays are 1, 2, 4, 8, then 16 seconds, capped there.
+  Set it to zero to disable recovery.
+- `--step-timeout-secs 60` bounds individual startup/read/release work;
+  `--timeout-secs 300` bounds asynchronous work, including backoff. Positive
+  `--snapshots` counts emitted snapshots, including unchanged catch-up reads.
+- Identity/genesis mismatches, malformed protocol or storage, rejected operations
+  such as `operationError`/`limitReached`, and output failures remain fatal.
+  Classification uses typed errors, not error-message matching.
+
+Flushed JSONL records distinguish `subscribed`, `retry`, `snapshot`, `behind` and
+`stopped`. A `snapshot` has `kind: initial`, `update` or `catch_up`, its finalized
+hash/number, `previous_number`, `changed`, and
+`historical_events_replayed: false`. Catch-up may return the same block again;
+it does **not** replay intermediate blocks, transactions or events. A restored
+checkpoint behind the last emitted number is followed without publishing a
+regression. A conflicting hash at the last emitted height fails closed; the
+example does not retain an ever-growing history for auditing old heights.
+Subscription alone is not proof that a node has caught up with the network.
+
+SIGINT/SIGTERM interrupt startup, reads, backoff and output, exiting successfully
+on intentional cancellation. Deadlines, exhausted recovery budgets and other
+failures exit unsuccessfully. Final protocol cleanup and terminal output share
+one two-second grace period; a best-effort stderr diagnostic may add 100ms.
+Cancellation can poison an in-flight RPC, so protocol cleanup may produce
+`cleanup_warning`; the transport is always dropped rather than reused. Normal
+completion requires successful cleanup and acknowledged output.
+
+Output has one recycled 4,096-byte record buffer, one pending write, and a
+two-second write/flush acknowledgement deadline. Oversized records fail before
+publication. A dedicated writer thread uses a duplicated descriptor without
+changing inherited flags or holding global stdio locks. It does not use Tokio's
+blocking pool: a stalled writer cannot hold runtime shutdown open.
+
+Cancellation or output failure permanently poisons that stream. No further JSONL
+is appended after an uncertain/partial record, so `stopped` may be absent; stderr
+reporting is also bounded if both sinks are blocked. The detached writer and its
+descriptor may survive until **process exit**. This is a standalone-example
+boundary, not a reusable cancellable writer for long-lived libraries. Consumers
+must tolerate a truncated final line on interrupted output.
+
+State/high-water marks are in memory only: restarting this application is not
+durable cursor recovery or an exactly-once guarantee.
+
 ## Run as a user service
 
 Requires Linux with a running systemd user manager. No root privileges or sudo:
@@ -626,10 +690,11 @@ no-clobber file publication:
 cargo test --locked --lib
 ```
 
-Focused offline checks for metadata/address decoding and the endurance harness:
+Focused offline checks for application decoding/recovery and the endurance harness:
 
 ```sh
-cargo test --locked --release --example watch-balance --example read-app-profile
+cargo test --locked --release --example watch-balance --example read-app-profile \
+  --example watch-recovering
 python3 -B -m unittest discover -s scripts -p 'test_soak.py'
 ```
 
@@ -847,6 +912,51 @@ checkpoint. Chain-spec/checkpoint updates need explicit provenance and review.
 
 Verified on x86-64 Linux with Rust 1.98.1 and systemd 261.
 
+### Bounded application output
+
+The hardened recovery example passed 20 focused tests and nine real-process
+pipe scenarios. Private pipes were filled to capacity and an actual
+kernel-blocked pipe writer was observed before cancellation; inherited output
+flags were unchanged after each child exited.
+
+Coverage included SIGINT/SIGTERM with full stdout, the total deadline and
+per-record timeout, simultaneous stdout/stderr blockage, a closed output pipe,
+and both signals during draining backoff. Every owned child exited and was
+reaped. These checks qualify bounded standalone-process shutdown, not cancellation
+of the kernel write itself or safe embedding of a stalled writer in a
+long-lived library.
+
+### Application-owned recovery
+
+The recovery example passed an 11-scenario live qualification against a private
+standalone daemon running Paseo and Next Bulletin, using the existing release
+daemon and newly built debug example:
+
+- Graceful daemon replacement and `SIGKILL` replacement each caused an explicit
+  transport retry, a fresh subscription and a catch-up read. The latter returned
+  the same finalized block, correctly marked unchanged.
+- A 60.003-second outage affected only a rootless private network namespace.
+  Its default route was explicitly restored and external HTTPS checked. The
+  application encountered one step timeout and three real
+  `operationInaccessible` failures, then advanced from finalized height 2,765,496
+  to 2,765,510 through application-owned recovery. No wrapper restarted the app,
+  and no synthetic inaccessible responses were injected.
+- Normal one-snapshot completion, SIGINT while following, and SIGINT/SIGTERM
+  during both backoff and an in-flight discovery RPC all terminated as intended.
+  The discovery cancellation cases used a byte relay withholding the real
+  daemon's response, not a simulated RPC response.
+- Zero allowed recoveries failed without retrying; a one-second overall deadline
+  exited unsuccessfully in 1.004 seconds.
+
+The combined lifecycle consumer used a 30-second step deadline, a 1,200-second
+total deadline and 64 allowed lifetime recoveries; these are qualification
+settings, not the example defaults. All 11 scenarios completed in 99.136 seconds.
+Owned processes and sockets were cleaned up, the temporary controller removed,
+and raw evidence retained privately outside build outputs. No installed service
+or host network configuration was changed. This is desktop process/network
+recovery evidence, not phone qualification, hardware suspend coverage, durable
+cursor recovery or proof of complete historical event delivery.
+
 ### Installed-service lifecycle
 
 On 2026-11-15, the actual installer and systemd user units were exercised with
@@ -892,7 +1002,9 @@ new consumer. It obtained initial and advanced finalized Bulletin storage.
 A subsequent native content fetch retrieved a pinned 3,658-byte raw block and
 matched its expected SHA-256. The daemon PID and Unix socket inode were unchanged.
 The wait is an observation window, not a measured minimum recovery latency.
-No application retries or daemon behavior changes were added.
+That qualification used a consumer without automatic recovery and did not change
+daemon behavior. The later [recovery example](#application-level-recovery) adds
+explicit policy above the client, not transparent continuity inside it.
 
 Earlier attempts incorrectly treated interface-up as restored networking: Linux
 had removed the private default route. Those failed attempts remain in the
