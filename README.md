@@ -847,6 +847,65 @@ checkpoint. Chain-spec/checkpoint updates need explicit provenance and review.
 
 Verified on x86-64 Linux with Rust 1.98.1 and systemd 261.
 
+### Installed-service lifecycle
+
+On 2026-11-15, the actual installer and systemd user units were exercised with
+the published diagnostic milestone. A temporary drop-in selected a private
+checkpoint directory and a 1 GiB/no-swap safety limit; the test did not enable
+login startup or change production allocator settings.
+
+- Starting only the socket left the daemon inactive until discovery connected.
+  Discovery then exposed the relay and all three pinned application chains.
+- Disconnecting one Bulletin consumer did not stop an independent Asset Hub
+  consumer from obtaining further verified finalized storage.
+- A graceful daemon restart preserved the socket inode. The old consumer
+  failed closed; a new connection/subscription obtained verified Bulletin data.
+- SIGKILL triggered the unit's automatic restart. The listener survived, the
+  previous client exited unsuccessfully, and a new Individuality consumer
+  obtained verified finalized storage. Checkpoint save/load markers were observed.
+- After a 30-second SIGSTOP/SIGCONT pause, the same daemon and consumer resumed
+  verified progress. This is a process-pause test, **not hardware suspend/resume**.
+
+The desktop scenario ended with both units stopped and the socket removed.
+Physical mobile and hardware suspend qualification remain separate requirements.
+Raw logs and checkpoint evidence stay outside the public repository.
+
+No running Linux phone is available for qualification, with no ETA. Physical
+mobile, battery and hardware suspend/resume testing is blocked; desktop process
+pausing and a cross-compiled binary must not be presented as substitutes.
+
+### Network-loss recovery
+
+The installed four-chain service was also exercised inside a rootless private
+network/mount namespace using privately extracted, signature-verified slirp4netns
+and libslirp packages. The workstation's network configuration was not changed.
+The test brought only the daemon's private interface down for 60 seconds.
+
+Local `/host` discovery remained available while verified finalized progress
+stopped. The existing diagnostic consumer failed closed with
+`operationInaccessible`; **seamless consumer continuity did not pass**.
+
+After restoring the interface and its original default route, an independent
+external HTTPS request verified connectivity. In a separate explicit-reconnect
+scenario, the test waited a fixed 60-second recovery window, then started one
+new consumer. It obtained initial and advanced finalized Bulletin storage.
+A subsequent native content fetch retrieved a pinned 3,658-byte raw block and
+matched its expected SHA-256. The daemon PID and Unix socket inode were unchanged.
+The wait is an observation window, not a measured minimum recovery latency.
+No application retries or daemon behavior changes were added.
+
+Earlier attempts incorrectly treated interface-up as restored networking: Linux
+had removed the private default route. Those failed attempts remain in the
+private evidence, but do not qualify network recovery. The corrected experiment
+recorded the missing route, restored it and verified external connectivity
+before assessing recovery. The separate consumer-continuity failure is retained
+as a real limitation, not replaced by the passing explicit-reconnect result.
+
+All test consumers, namespace helpers and temporary units were stopped. The
+temporary installation/drop-in and throwaway scripts were removed; private
+checkpoint, journal and qualification evidence were preserved.
+
+
 ### Sustained diagnostics with the default allocator
 
 A subsequent isolated run reused the verified diagnostic binaries with default
