@@ -912,6 +912,61 @@ checkpoint. Chain-spec/checkpoint updates need explicit provenance and review.
 
 Verified on x86-64 Linux with Rust 1.98.1 and systemd 261.
 
+### Six-hour default-profile mixed workload
+
+The published recovery/output milestone `62be0a7` completed 21,600 workload
+seconds after verified readiness on all four default routes: the substitute
+Paseo relay, Next Asset Hub, Next Bulletin and Next Individuality/People.
+Startup took 15.38 seconds. A private standalone daemon and one continuous
+recovery application were used; neither was restarted during the run.
+
+The workload rotated one-finalization probes across all routes, fetched two
+pinned small content leaves each minute, and added a pair of pinned 10-block
+files every tenth cycle. Resource sampling ran every ten seconds, excluding
+the first five workload minutes from steady aggregates. The transient unit had
+a 2 GiB safety limit and no swap; this was not a measured memory ceiling.
+
+| Observed result | Count |
+| --- | ---: |
+| Continuous application snapshots | 3,585 |
+| Completed rotating probes | 1,439 |
+| Verified rotating storage reads | 2,878 |
+| Verified content downloads | 792 |
+| Small / large verified content pairs | 360 / 36 |
+| Visible application recoveries | 1 |
+| Unexpected failures / forced kills | 0 / 0 |
+| Checkpoint-save markers | 361 |
+
+The recovery was a real `operationInaccessible`: the application waited one
+second, resubscribed and read a catch-up snapshot from height 2,767,188 to
+2,767,190. It did not replay the intermediate block or claim complete event
+delivery. The finite one-snapshot readiness application also completed normally.
+
+| Process | Mean CPU, one core = 100% | First steady RSS | Final / peak steady RSS |
+| --- | ---: | ---: | ---: |
+| Daemon | 0.764% | 200.0 MiB | 388.9 / 388.9 MiB |
+| Recovery application | 0.0046% | 4.76 MiB | 3.56 / 4.77 MiB |
+
+Functional qualification passed, but daemon memory did not establish a plateau:
+the final 359 samples spanning 3,597.8 seconds rose from 384.23 to 388.93 MiB
+(4.70 MiB). The application's RSS stayed at 3.56 MiB over that window. These
+observations do not distinguish allocator retention, caches or a leak; no
+allocator tuning was applied.
+
+All probes and downloads exited zero. SIGTERM stopped the continuous application
+with validated counters and the expected warning that its interrupted RPC could
+not perform protocol cleanup; its socket was dropped and the process exited zero.
+The daemon exited zero after its shutdown checkpoint. The temporary socket,
+unchanged controller scripts and qualification build pin were removed; private
+logs, checkpoints, summaries and binary identities remain outside build outputs.
+No installed service or host networking was changed.
+
+An initial preflight failed closed because its harness used original Paseo's
+registry pin for the substitute-Paseo fixture. The corrected pin was independently
+derived from the immutable, hash-verified public compact specification's genesis
+header, not copied from RPC. That failed evidence was retained; the corrected
+three-minute preflight and subsequent six-hour run both passed.
+
 ### Bounded application output
 
 The hardened recovery example passed 20 focused tests and nine real-process
