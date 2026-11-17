@@ -83,9 +83,10 @@ None of the above requires introducing Zenoh.
 
 ## Build
 
-A Linux environment and a Rust toolchain supporting edition 2024 are required.
-Python 3 is needed for the installer and acceptance script. The lockfile fixes
-dependency versions, including `smoldot-light` 4.0.0 and its native runtime dependencies.
+A Linux environment and a Rust toolchain supporting edition 2024 are required;
+the experimental release is built with Rust 1.98.1. Python **3.11+** is needed for
+the installer and release tooling. The lockfile fixes dependency versions,
+including `smoldot-light` 4.0.0 and its native runtime dependencies.
 
 ```sh
 cargo build --locked --bins
@@ -93,6 +94,57 @@ cargo build --locked --bins
 
 Build artifacts go in `target/` unless your local build tooling overrides that
 location. Source and chain state must not be stored in disposable build outputs.
+
+### Experimental Linux archives
+
+Release preparation is local; it does not push commits, create tags, upload
+assets, or publish a GitHub Release. The initial target is **Linux x86_64 GNU
+with a systemd user manager**. Ubuntu 24.04 is the qualification baseline.
+Other Ubuntu versions, AArch64/mobile and macOS are not qualified by this preview.
+
+When a binary archive is available, verify it against its accompanying
+`SHA256SUMS`, extract it into a new directory, then run there:
+
+```sh
+python3 scripts/user-service.py install --bin-dir ./bin
+systemctl --user enable --now smolhost.service
+~/.local/bin/smolhost chains
+```
+
+No Rust compiler is needed to use the binary archive. This is still the read-only
+four-chain **Paseo Next v2 test profile**, not a production Polkadot node.
+Checksums detect altered downloads; they are not a signature or proof of who
+published them. Obtain the archive and checksum list from the trusted release
+page together.
+
+Maintainers prepare archives from the exact public working-tree source:
+
+```sh
+cargo build --locked --release --bins
+release_work="$HOME/smolhost-release-work"
+mkdir -p "$release_work"
+cargo vendor --locked --versioned-dirs "$release_work/vendor"
+python3 scripts/release.py --bin-dir "$PWD/target/release" \
+  --vendor-dir "$release_work/vendor" --output "$release_work/artifacts"
+```
+
+The output directory must not already exist and must be outside the input and
+build trees. It contains a binary archive, corresponding-source archive,
+`artifact-manifest.json` and `SHA256SUMS`. Each archive contains a
+`release-manifest.json` with exact file hashes, version, ABI requirements and
+source snapshot identity; it does not pretend uncommitted work is a public tag.
+The source archive includes pinned vendored dependencies and relative offline
+Cargo configuration. From its extracted root, with the documented compiler and
+native build prerequisites installed:
+
+```sh
+cargo build --offline --locked --release --bins
+```
+
+Both archives carry dependency license metadata and available notices. This is
+not a legal audit, reproducible-build claim or runtime qualification by itself.
+Keep source, release archives and qualification evidence outside disposable
+compiler outputs. Public publication is a separate, deliberate step.
 
 ## Run manually
 
@@ -591,7 +643,45 @@ python3 scripts/user-service.py uninstall
 The installer refuses conflicting files. Uninstall checks recorded hashes and
 refuses modified installed files before stopping anything; back up/remove or
 restore those modifications first. Unrelated files and systemd drop-ins are left
-alone. For this spike, update by uninstalling and then reinstalling.
+alone.
+
+### Upgrading an installer-owned four-chain installation
+
+Use the **new** package's installer and binaries:
+
+```sh
+python3 scripts/user-service.py upgrade --bin-dir ./bin
+```
+
+For a source build, select its actual output directory instead. Upgrade checks
+the receipt, owned files, CLI link and loaded unit sources before stopping
+anything. Custom unit drop-ins or modified files require deliberate manual
+migration; they are not overwritten. Concurrent installer operations are refused.
+
+Upgrade stages verified backups and replacements, stops both units, atomically
+replaces each owned file, reloads systemd and restores prior activity. Enablement,
+linger policy and the chain-state directory are not changed. Existing application
+sessions disconnect: clients must reconnect and resubscribe. A running service is
+checked through discovery before committing; a socket-only installation briefly
+activates for the same check, then returns to socket-only operation. A fully
+stopped installation stays stopped and cannot provide a runtime health check.
+Discovery validates startup/catalog availability, not chain synchronization.
+
+On failure, the installer restores the original files/receipt and previous
+service/socket activity. If interrupted by process death or power loss, the next
+installer operation refuses the unfinished journal; recover using:
+
+```sh
+python3 scripts/user-service.py recover
+```
+
+Recovery rolls back an unfinished upgrade, but does not undo one already marked
+committed. Changed installed files, damaged backups or changed unit enablement
+cause refusal with the private journal retained at
+`~/.local/lib/.smolhost-upgrade`; preserve those files and resolve the conflict
+before retrying. Do not change units/settings during an upgrade. The installer
+does not migrate or roll back checkpoint formats; this preview keeps the existing
+format. Unrelated bundle files and chain state survive upgrades and uninstall.
 
 The service follows the lifetime of your user manager. This installer does not
 enable lingering, change logout policy, or claim operation during device suspend.
@@ -696,6 +786,8 @@ Focused offline checks for application decoding/recovery and the endurance harne
 cargo test --locked --release --example watch-balance --example read-app-profile \
   --example watch-recovering
 python3 -B -m unittest discover -s scripts -p 'test_soak.py'
+python3 -B -m unittest discover -s scripts -p 'test_user_service.py'
+python3 -B -m unittest discover -s scripts -p 'test_release.py'  # also needs a C compiler
 ```
 
 For a live test against public Paseo peers, build both binaries first, then run:
@@ -860,13 +952,30 @@ See the pinned [upstream implementation](https://docs.rs/crate/smoldot-light/4.0
   both ends. Browser-origin handshakes and unknown chain paths are rejected.
 - Same-UID processes are not mutually sandboxed. Do not expose this prototype to
   untrusted users or treat it as a security boundary between your own applications.
-- Maximum 16 connections, including discovery connections and pending handshakes;
-  32 pending RPC requests and 8 subscriptions per chain session. Incoming frames
-  are limited to 64 KiB and outgoing RPC messages to 8 MiB. Content has the tighter
-  protocol limits above. Handshakes and blocked writes have a five-second deadline.
-- No unbounded host-side forwarding queue. A blocked client loses its connection
-  and must resubscribe, rather than silently losing ordered events. These transport
-  limits are not a guarantee of a fixed total smoldot/runtime memory footprint.
+- Maximum 16 connections, including discovery connections and pending handshakes.
+  Incoming frames are limited to 64 KiB and outgoing RPC messages to 8 MiB.
+  Content has the tighter protocol limits above. Handshakes and blocked writes
+  have a five-second deadline.
+- Smolhost enforces at most 32 pending RPC requests per chain connection, including
+  notifications. It reserves at most 8 follow slots, counting pending follows and
+  active subscriptions together. Upstream can impose a lower limit: the pinned
+  implementation currently permits only 2 active follows per frontend.
+- Over-limit requests are rejected before enqueueing with JSON-RPC code `-32000`.
+  `error.data.resource` is `pending_requests` or `subscriptions`; `error.data.limit`
+  gives the corresponding cap. Over-limit notifications are not forwarded and
+  receive no response.
+- Forwarded requests receive private correlation IDs. Replies restore client IDs,
+  including null, reused IDs and numeric IDs beyond native integer precision.
+  Admitted notifications consume pending capacity until their internal reply is
+  consumed, then that reply is suppressed. Failed follows, acknowledged unfollows
+  and matching follow `stop` events release subscription capacity. Unexpected or
+  duplicate upstream response IDs fail the connection rather than release a slot.
+- These bounds do not rely on the configured smoldot-light 4.0.0 limits: its
+  [RPC implementation](https://docs.rs/crate/smoldot-light/4.0.0/source/src/json_rpc_service.rs)
+  leaves those settings unused and uses an unbounded request channel internally.
+- A blocked client loses its connection and must resubscribe, rather than silently
+  losing ordered events. Transport timeouts and message-size limits are not a
+  guarantee of a fixed total smoldot/runtime memory footprint.
 - `rpc_methods` advertises only allowed read-only methods: supported `chainSpec_v1_*`
   and `chainHead_v1_*` operations. Transaction, administrative, legacy and raw
   Bitswap RPCs are unavailable through `/rpc`; content uses its separate bounded
@@ -966,6 +1075,115 @@ registry pin for the substitute-Paseo fixture. The corrected pin was independent
 derived from the immutable, hash-verified public compact specification's genesis
 header, not copied from RPC. That failed evidence was retained; the corrected
 three-minute preflight and subsequent six-hour run both passed.
+
+### Linux release and upgrade qualification
+
+The `0.1.0-alpha.1` Linux x86_64 candidate passed a real Ubuntu 24.04 KVM guest
+with PID 1 systemd and a normal user's systemd manager. Qualification used the
+packaged binaries and installer, not a substitute daemon or manager:
+
+- Fresh installation remained stopped/disabled until explicitly enabled.
+- Discovery matched all four independently pinned chain identities; each chain
+  returned verified finalized storage and a subsequent finalized advance.
+- A clean restart loaded the saved checkpoint.
+- Upgrade from a local pre-release `0.1.0` four-chain installation preserved
+  active/enabled, stopped/disabled and socket-only operation.
+- Modified binaries and a conflicting CLI file were refused without changing
+  the running daemon's PID or invocation.
+- An intentionally failing replacement daemon triggered rollback of the exact
+  original files and receipt, then restored the original running service.
+- Uninstall removed owned files while retaining checkpoints and unrelated files.
+
+Twelve isolated installer tests additionally cover abrupt process exit between
+replacements, interrupted rollback/commit cleanup and refusal of damaged backups
+or edits made after interruption. Their manager is simulated; the Ubuntu run
+supplies the real systemd evidence. Thirty-eight packaging tests cover archive
+integrity, source/vendor completeness, unsafe paths, ABI/version mismatch and
+overwrite refusal. The source archive resolved all 371 workspace/dependency
+packages with an empty Cargo home and `cargo metadata --offline --locked`.
+This is offline dependency-resolution evidence, not a second full source build
+or a reproducible-build claim.
+
+The binaries' observed GLIBC requirement is 2.34; Ubuntu qualification used
+glibc 2.39. This short lifecycle run does not replace the longer Linux soaks,
+establish a production SLA, or qualify other distributions, AArch64, mobile,
+logout/suspend behavior or macOS. Raw VM logs and credentials remain private.
+
+### Host-side RPC admission qualification
+
+35 focused IPC tests passed, covering request admission, notification accounting,
+pending follow reservations, lifecycle errors, stale unfollow acknowledgements,
+unknown/duplicate upstream replies and exact large-number ID correlation. A new
+regression first reproduced rounding of `18446744073709551617`; admission now
+retains such client IDs as raw JSON without enabling globally allocating
+arbitrary-precision number parsing.
+
+A 72.6-second live run used the default four-chain profile, eight concurrent flood
+clients, ordinary verified probes and the actual recovering Bulletin application.
+Floods included valid requests near 60 KiB while continuously draining responses.
+
+| Observed result | Count |
+| --- | ---: |
+| Identified flood requests | 5,120 |
+| Additional notifications sent, with no replies | 1,152 |
+| Explicit host admission rejections | 81 |
+| Ordinary verified probes, before/during/after flood | 12 |
+| Verified storage reads overlapping flood | 8 |
+| Recovery-application snapshots / recoveries | 12 / 0 |
+| Unexpected errors | 0 |
+
+All 5,140 identified requests across the raw-client scenarios received exactly one
+matching reply. The additional expected upstream rejection was a third active
+follow; unfollowing released capacity and a replacement follow succeeded. Duplicate,
+null, string-versus-number and larger-than-64-bit request IDs survived the live
+round trip. The same connection remained usable after the notification flood.
+Peer-driven follow `stop` events and the host's reserved-eight boundary were covered
+deterministically, not forced against the lower upstream live limit.
+
+Sampled daemon RSS peaked at 165.2 MiB; the largest one-second CPU interval during
+flooding was 5.0% of one core. This short, different workload does not demonstrate
+a memory reduction or a long-term ceiling. No allocator tuning was applied.
+The recovery application acknowledged SIGTERM and exited zero; the daemon saved
+its shutdown checkpoint, exited zero and removed its socket. All children were
+reaped. An earlier controller buffer-lifetime failure was preserved separately;
+it was not counted as a passing run.
+
+### Allocator-retention investigation
+
+A 15-minute follow-up used the unchanged `62be0a7` release binaries, the same
+four-chain profile and fresh private checkpoint state. A diagnostic preload
+observed the original glibc allocator without replacing allocation functions;
+it added one observer thread. Process memory was sampled every two seconds,
+`mallinfo2` every five seconds, and phase-boundary `malloc_info` snapshots
+accounted for 16 arenas.
+
+| End-of-phase sample | Daemon RSS | glibc allocated accounting |
+| --- | ---: | ---: |
+| 90 seconds watching only | 172.4 MiB | 69.4 MiB |
+| 180 seconds adding rotating probes | 198.3 MiB | 69.7 MiB |
+| 300 seconds adding repeated content pairs | 324.6 MiB | 70.0 MiB |
+| 60 seconds with application clients disconnected | 324.9 MiB | 70.0 MiB |
+
+Content pairs were deliberately accelerated: two small leaves followed by two
+large files every 30 seconds. At the first quiescent boundary, glibc reported
+281.3 MiB free inside its arenas. An explicit diagnostic `malloc_trim(0)` reduced
+RSS by 80.6 MiB without changing glibc's allocated-byte total. After repeating
+the mixed workload and disconnecting clients, a second trim reclaimed 69.7 MiB,
+again without changing allocated bytes. Chain synchronization stayed running;
+RSS grew again after each trim.
+
+This reproduces allocator retention/fragmentation rather than a corresponding
+accumulation of allocated heap. Accounting includes thread caches and is not a
+reachable-object census or a measure of every VM mapping. The experiment does
+not prove a six-hour memory ceiling, rule out every leak, or isolate glibc's
+dynamic mmap threshold as the mechanism. No production allocator tuning or
+periodic trimming was added.
+
+The run verified 132 storage reads across 66 probes, 64 downloads and 125 watcher
+snapshots. All 132 application sessions closed; daemon and watchers exited zero,
+and the temporary socket was removed. Source inspection also identified the
+upstream's unenforced RPC limits; the host-side admission fix is qualified above.
+The cooperative allocator workload did not establish that queue as its growth cause.
 
 ### Bounded application output
 
@@ -1380,8 +1598,10 @@ findings, and contributions are welcome in
 [GitHub issues](https://github.com/replghost/smolhost/issues). Explain what
 you changed and tested; do not post secrets or sensitive vulnerability details.
 
-The next experiment is actual AArch64/mobile resource and suspend/resume
-validation, not an automatic rollout of every system chain.
+The current release work targets desktop/server Linux. AArch64/mobile resource
+and suspend/resume validation remain unqualified: no Linux phone hardware or ETA
+is available. macOS needs a separate launchd/path-portability effort. Neither
+requires automatically adding more default chains.
 
 ## License
 

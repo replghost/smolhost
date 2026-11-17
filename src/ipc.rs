@@ -26,8 +26,12 @@ use crate::{
     engine::{Session, SharedEngine},
 };
 
+mod admission;
+
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_CONNECTIONS: usize = 16;
+pub(crate) const MAX_PENDING_REQUESTS: u32 = 32;
+pub(crate) const MAX_SUBSCRIPTIONS: u32 = 8;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -167,6 +171,7 @@ pub async fn serve(
         Route::Chain(index) => Some(Session::open(engine, &chains[index])?),
         Route::Content(_) => unreachable!("content is served separately"),
     };
+    let mut budget = session.as_ref().map(|_| admission::Budget::new());
     loop {
         let outgoing = tokio::select! {
             message = socket.next() => {
@@ -175,9 +180,13 @@ pub async fn serve(
                     Some(Err(error)) => return Err(error.into()),
                     Some(Ok(Message::Text(text))) => {
                         if let Some(session) = &session {
-                            match validate_request(&text) {
-                                Ok(()) => { session.request(text.to_string())?; continue; }
-                                Err(Some(error)) => Message::Text(error.to_string().into()),
+                            let budget = budget.as_mut().expect("RPC session has admission budget");
+                            match validate_request(&text)
+                                .map_err(|error| error.map(|value| value.to_string()))
+                                .and_then(|request| budget.admit(request, &text))
+                            {
+                                Ok(request) => { session.request(request)?; continue; }
+                                Err(Some(error)) => Message::Text(error.into()),
                                 Err(None) => continue,
                             }
                         } else {
@@ -200,6 +209,11 @@ pub async fn serve(
             } => {
                 let response = response.context("engine response stream closed")?;
                 ensure!(response.len() <= MAX_RESPONSE_BYTES, "RPC response exceeds transport limit");
+                let Some(response) = budget.as_mut()
+                    .expect("RPC session has admission budget")
+                    .response(response)? else {
+                        continue;
+                    };
                 Message::Text(filter_methods(response).into())
             }
         };
@@ -283,7 +297,7 @@ fn parse_request(text: &str) -> std::result::Result<Value, Option<Value>> {
     Ok(request)
 }
 
-fn validate_request(text: &str) -> std::result::Result<(), Option<Value>> {
+fn validate_request(text: &str) -> std::result::Result<Value, Option<Value>> {
     let request = parse_request(text)?;
     let id = request.get("id");
     if !allowed_method(request["method"].as_str().unwrap()) {
@@ -295,7 +309,7 @@ fn validate_request(text: &str) -> std::result::Result<(), Option<Value>> {
             )
         }));
     }
-    Ok(())
+    Ok(request)
 }
 
 fn host_response(text: &str, catalog: &HostCatalog) -> Option<String> {

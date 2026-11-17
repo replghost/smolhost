@@ -14,7 +14,7 @@ use smoldot_light::{AddChainConfig, AddChainConfigJsonRpc, ChainId, Client, Json
 
 use crate::{
     discovery::{ChainInfo, HostInfo, PROTOCOL_VERSION},
-    ipc::{MAX_RESPONSE_BYTES, allowed_method},
+    ipc::{MAX_PENDING_REQUESTS, MAX_RESPONSE_BYTES, MAX_SUBSCRIPTIONS, allowed_method},
     platform::Platform,
 };
 pub type SharedEngine = Arc<Mutex<Engine>>;
@@ -336,8 +336,8 @@ impl CheckpointClient {
 
         loop {
             // A caller's timeout can cancel this future, but not smoldot's request.
-            // Drain that response before enqueueing another: the private frontend
-            // allows only one request whose response has not yet been consumed.
+            // Drain that response before enqueueing another: we enforce one
+            // outstanding request here, independently of upstream's advisory limit.
             if self.pending_request.is_none() {
                 let request = format!(
                     r#"{{"jsonrpc":"2.0","id":{request_id},"method":"chainHead_unstable_finalizedDatabase","params":[{}]}}"#,
@@ -440,10 +440,16 @@ impl Session {
             .add_chain(config(
                 &configured.specification,
                 "",
+                // Upstream 4.0.0 ignores these settings. Public RPC admission is
+                // enforced in ipc; private startup/content callers are sequential.
                 AddChainConfigJsonRpc::Enabled {
-                    max_pending_requests: NonZeroU32::new(if application { 32 } else { 1 })
-                        .unwrap(),
-                    max_subscriptions: if application { 8 } else { 0 },
+                    max_pending_requests: NonZeroU32::new(if application {
+                        MAX_PENDING_REQUESTS
+                    } else {
+                        1
+                    })
+                    .unwrap(),
+                    max_subscriptions: if application { MAX_SUBSCRIPTIONS } else { 0 },
                 },
                 configured.relay_anchor,
             ))

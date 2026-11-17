@@ -18,6 +18,7 @@ use tokio::{
 
 #[derive(Parser)]
 #[command(
+    name = "smolhostd",
     version,
     about = "Experimental read-only light-client RPC over a private Unix socket"
 )]

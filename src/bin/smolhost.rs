@@ -15,7 +15,7 @@ use smolhost::client::{Connection, RpcClient, connect_chain, discover};
 const NUMBER_KEY: &str = "0x26aa394eea5630e07c48ae0c9558cef702a5c1b19ab7a04f536c519aca4983ac";
 
 #[derive(Parser)]
-#[command(about = "Read-only diagnostics for a local Smolhost daemon")]
+#[command(version, about = "Read-only diagnostics for a local Smolhost daemon")]
 struct Args {
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
