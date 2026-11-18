@@ -171,7 +171,7 @@ class DebianPackageTests(unittest.TestCase):
 
     def test_real_deb_metadata_ownership_payload_and_no_service_hooks(self):
         artifact = self.built_package(checksum=self.sha256.upper())
-        self.assertEqual(artifact.name, "smolhost_0.1.0~alpha.1-1_amd64.deb")
+        self.assertEqual(artifact.name, "smolhost_0.1.0.alpha.1-1_amd64.deb")
         self.assertEqual((self.output / "SHA256SUMS").read_text(),
                          f"{digest(artifact)}  {artifact.name}\n")
         for option in ("--fsys-tarfile", "--ctrl-tarfile"):

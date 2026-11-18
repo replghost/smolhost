@@ -169,8 +169,11 @@ Verify downloaded native artifacts against their accompanying
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS-packages
-sudo apt install ./smolhost_0.1.0~alpha.1-1_amd64.deb
+sudo apt install ./smolhost_0.1.0.alpha.1-1_amd64.deb
 ```
+
+The `.deb` filename uses `.` where its internal Debian prerelease version uses
+`~`; this avoids GitHub's asset-name rewriting and keeps checksum entries valid.
 
 Stop if checksum verification fails. For a self-contained Arch recipe archive,
 extract into a new directory, inspect `PKGBUILD` and `package_layout.py`, then

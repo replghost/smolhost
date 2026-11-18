@@ -107,7 +107,8 @@ def build_deb(archive, expected_sha256, output, revision=1):
             package_layout.stage_bundle(bundle, staging)
             staging.chmod(0o755)
             write_metadata(staging, manifest, version)
-            name = f"smolhost_{version}_amd64.deb"
+            # GitHub rewrites "~" in asset names; normalize before writing checksums.
+            name = f"smolhost_{version.replace('~', '.')}_amd64.deb"
             artifact = output / name
             subprocess.run([dpkg_deb, "--root-owner-group", "-Zxz", "--build",
                             str(staging), str(artifact)], check=True)
