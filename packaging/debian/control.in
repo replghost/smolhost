@@ -1,0 +1,15 @@
+Package: smolhost
+Version: ${version}
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: replghost <110247003+replghost@users.noreply.github.com>
+Installed-Size: ${installed_size}
+Depends: libc6 (>= ${glibc_floor}), libgcc-s1, systemd, dbus-user-session
+Homepage: https://github.com/replghost/smolhost
+Description: experimental shared Polkadot light-client user service
+ Independent, unofficial light-client daemon and command-line client, powered
+ by smoldot. Provides read-only Polkadot JSON-RPC over a local Unix socket.
+ Includes pinned Paseo chain specifications and opt-in systemd user units.
+ No services are enabled, started, restarted or stopped by this package.
+ Experimental prototype; not security-audited or suitable for production funds.

@@ -42,6 +42,10 @@ examples/recovery_output/mod.rs examples/recovery_output/tests.rs
 scripts/content-soak.py scripts/test_content_soak.py scripts/soak.py
 scripts/test_soak.py scripts/smoke.py scripts/user-service.py
 scripts/test_user_service.py scripts/release.py scripts/test_release.py
+scripts/package_layout.py scripts/test_package_layout.py
+scripts/build-deb.py scripts/test_build_deb.py
+scripts/build-aur.py scripts/test_build_aur.py
+packaging/debian/control.in packaging/debian/copyright.in packaging/aur/PKGBUILD.in
 chains/paseo.json chains/paseo_asset_hub.json chains/paseo_next_asset_hub.json
 chains/paseo_next_bulletin.json chains/paseo_next_individuality.json
 chains/paseo-next-v2-provenance.json

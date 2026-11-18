@@ -1,0 +1,26 @@
+Upstream-Name: smolhost
+Upstream-Contact: https://github.com/replghost/smolhost/issues
+Source: https://github.com/replghost/smolhost
+Corresponding-Source: https://github.com/replghost/smolhost/releases/download/v${upstream_version}/smolhost-v${upstream_version}-source.tar.gz
+
+Smolhost declares GPL-3.0-or-later for its own code in Cargo.toml. The complete
+upstream GPL version 3 text is installed at /usr/share/licenses/smolhost/LICENSE.
+The upstream project does not supply a separate copyright-holder statement;
+this packaging metadata does not assign copyright ownership to the maintainer
+or to anyone else. Refer to the corresponding source for original notices.
+
+Third-party components retain their respective copyrights and licenses.
+The complete verbatim notices supplied in the upstream binary release are
+installed under /usr/share/licenses/smolhost/third-party/licenses/.
+The accompanying /usr/share/licenses/smolhost/third-party/dependencies.json
+records each pinned dependency's upstream license expression, license-file
+metadata, original registry package checksum and installed notice paths.
+The inventory includes build, development and target-specific dependencies;
+it does not claim that every listed component is linked into these binaries.
+No third-party notice is replaced by this summary, and this is not a legal audit.
+
+The public corresponding-source archive linked above contains the release's
+source snapshot, locked vendored dependency sources and offline build inputs.
+Release metadata and per-file hashes are retained at
+/usr/share/doc/smolhost/upstream-release-manifest.json. The packaging operation
+copies prebuilt binaries unchanged; it makes no reproducible-build claim.

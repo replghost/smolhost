@@ -146,6 +146,138 @@ not a legal audit, reproducible-build claim or runtime qualification by itself.
 Keep source, release archives and qualification evidence outside disposable
 compiler outputs. Public publication is a separate, deliberate step.
 
+## Native Linux packages
+
+Native packages reuse the checksum-pinned upstream Linux x86_64 binary release;
+they do not compile a different engine. Ubuntu uses a `smolhost` `.deb`; Arch and
+Omarchy use the `smolhost-bin` recipe. Generating a recipe does **not** publish an
+AUR listing. Until a listing exists, build the self-contained recipe locally
+rather than assuming `yay -S smolhost-bin` is available.
+
+The package manager owns `/usr/bin/smolhost`, `/usr/bin/smolhostd`,
+`/usr/share/smolhost/chains/` and `/usr/lib/systemd/user/smolhost.{service,socket}`.
+Licenses and notices are under `/usr/share/licenses/smolhost/`; the upstream
+release manifest and README are under `/usr/share/doc/smolhost/`. The user unit
+is derived from the upstream unit with package-owned executable/specification
+paths; socket permissions, sandboxing and checkpoint policy are unchanged.
+Nothing is installed into a user's home by a package maintainer script.
+
+### Installing a native package
+
+Verify downloaded native artifacts against their accompanying
+`SHA256SUMS-packages` before installing. For an Ubuntu `.deb`:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS-packages
+sudo apt install ./smolhost_0.1.0~alpha.1-1_amd64.deb
+```
+
+Stop if checksum verification fails. For a self-contained Arch recipe archive,
+extract into a new directory, inspect `PKGBUILD` and `package_layout.py`, then
+run `makepkg -si` as your regular user. `base-devel` and Python 3.11+ are build
+requirements; neither native package requires Python just to run the daemon.
+The recipe pins both the public binary archive and its local layout helper.
+
+A prebuilt Arch package can also be installed directly, after the same checksum
+verification, without building the recipe:
+
+```sh
+sudo pacman -U ./smolhost-bin-0.1.0alpha1-1-x86_64.pkg.tar.zst
+```
+
+Installation leaves both user units stopped/disabled. If you already have a
+user-local installation, follow the migration instructions below first.
+Otherwise, opt in as the user who will run applications—not with sudo:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now smolhost.service
+/usr/bin/smolhost chains
+```
+
+Enable only `smolhost.socket` instead for on-demand activation. The daemon still
+runs as that user, with the same private `$XDG_RUNTIME_DIR/smolhost/rpc.sock` and
+`$XDG_STATE_HOME/smolhost` state (normally `~/.local/state/smolhost`). Native
+packages do not enable linger or change logout/suspend policy.
+
+### Native upgrades and removal
+
+Install the newer package through the package manager. Packages do not restart
+existing user services; a running process can still be the old executable.
+Each opted-in user should reload the units and restart only if already running:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user try-restart smolhost.service
+```
+
+Existing RPC sessions disconnect on restart and must reconnect/resubscribe.
+Stopped services remain stopped; listening sockets can activate on the next
+connection. These packages use native package-manager upgrade semantics:
+the user-local installer's automatic rollback and `recover` commands do **not**
+manage package-owned files. Checkpoint-format compatibility still matters when
+changing engine versions.
+
+Before package removal, each opted-in user must stop and disable **both** units:
+
+```sh
+systemctl --user disable --now smolhost.service smolhost.socket
+```
+
+Then remove with `sudo apt purge smolhost` or `sudo pacman -R smolhost-bin`,
+and run `systemctl --user daemon-reload` in that user's session. Packages own
+only their system files; removal/purge leaves user checkpoints and unrelated
+files intact. Root package scripts do not enumerate and kill users' processes.
+
+### Migrating from a user-local installation
+
+`~/.config/systemd/user/` units take precedence over packaged units, and a
+`~/.local/bin/smolhost` link may take precedence over `/usr/bin/smolhost`.
+Installing a native package deliberately does not delete or adopt either.
+
+1. Install the native package without enabling its units.
+2. As the original user, run `python3 scripts/user-service.py uninstall` from
+   the original extracted release/source installation. It checks ownership,
+   stops/disables both old units and preserves chain state. If files were
+   modified, preserve/resolve those changes first; do not blindly delete them.
+3. Run `hash -r` in shells that cache executable locations, then
+   `systemctl --user daemon-reload`.
+   Review `systemctl --user cat smolhost.service` for remaining user drop-ins.
+   The old installer preserves them; overrides referring to the old executable
+   or specification paths need deliberate migration before starting the new unit.
+4. Enable the packaged service or socket as above. Check
+   `systemctl --user show smolhost.service -p FragmentPath`; it should resolve
+   to `/usr/lib/systemd/user/smolhost.service`.
+
+The current native packages use the same four specifications and checkpoint
+format as the upstream archive, so the packaged daemon can resume existing
+state. Classic-profile/old-name migrations still require their original
+installer; the native package never guesses ownership of old home-directory files.
+
+### Building native artifacts
+
+The builders need Python 3.11+. Run the Debian builder where `dpkg-deb` is
+available and the AUR generator where `makepkg` is available. For the published
+archive downloaded into `~/Downloads`, from this source checkout:
+
+```sh
+release_archive="$HOME/Downloads/smolhost-v0.1.0-alpha.1-linux-x86_64.tar.gz"
+release_sha=ae114f67d7de6310a4595e334e8c29039b7b7b80edcc3f128333dddbc06e948f
+native_work="$(mktemp -d "$HOME/smolhost-native-XXXXXXXX")"
+python3 -B scripts/build-deb.py --archive "$release_archive" --sha256 "$release_sha" \
+  --output "$native_work/debian"
+python3 -B scripts/build-aur.py --archive "$release_archive" --sha256 "$release_sha" \
+  --output "$native_work/aur"
+```
+
+Outputs must be new directories. The Debian builder emits the `.deb` and
+`SHA256SUMS`; the AUR generator emits `PKGBUILD`, authoritative `.SRCINFO` and
+the checksum-pinned helper. The helper is copied into that submission tree,
+not fetched from an unpublished commit. `--revision` changes the native package
+revision without inventing a new upstream binary version. Prereleases sort
+before final versions: Debian `0.1.0~alpha.1-1`, Arch `0.1.0alpha1-1`.
+There is no custom updater, APT repository or automatic AUR submission.
+
 ## Run manually
 
 Start the daemon in one terminal:
@@ -788,6 +920,9 @@ cargo test --locked --release --example watch-balance --example read-app-profile
 python3 -B -m unittest discover -s scripts -p 'test_soak.py'
 python3 -B -m unittest discover -s scripts -p 'test_user_service.py'
 python3 -B -m unittest discover -s scripts -p 'test_release.py'  # also needs a C compiler
+PYTHONPATH=scripts python3 -B -m unittest test_package_layout test_build_aur
+# On a system with dpkg-deb:
+PYTHONPATH=scripts python3 -B -m unittest test_build_deb
 ```
 
 For a live test against public Paseo peers, build both binaries first, then run:
@@ -1075,6 +1210,36 @@ registry pin for the substitute-Paseo fixture. The corrected pin was independent
 derived from the immutable, hash-verified public compact specification's genesis
 header, not copied from RPC. That failed evidence was retained; the corrected
 three-minute preflight and subsequent six-hour run both passed.
+
+### Native package qualification
+
+The `.deb` and self-contained `smolhost-bin` recipe were exercised in real
+Ubuntu 24.04 and Arch rolling x86_64 KVM guests, using APT/dpkg and
+makepkg/pacman respectively. Both passed:
+
+- Fresh installation left user units inactive/disabled. Explicit activation ran
+  `/usr/bin/smolhostd` as the normal user with a private `0600` socket.
+- All four pinned chains returned verified finalized storage and a subsequent
+  finalized advance; restarting restored a saved checkpoint.
+- Active, stopped and socket-only package upgrades preserved user policy.
+  Active upgrades did not change the daemon PID/invocation until explicit restart.
+- Installing alongside a user-local instance left it untouched. Removing that
+  original installer-owned instance and enabling the packaged unit resumed the
+  same checkpoint under the package-owned executable.
+- Removal/purge after explicit stop/disable removed package-owned files while
+  preserving checkpoints and unrelated user state.
+
+The upgrade scenarios used native revisions 1 and 2 of the **same** published
+`0.1.0-alpha.1` binaries. They prove package-manager lifecycle behavior, not an
+engine/checkpoint-format migration. Native packages retain the upstream binary
+bytes. No host package or user service was installed during qualification.
+
+Thirty-one native packaging checks and 38 existing release checks passed.
+An initial Debian test incorrectly rejected the archive's valid `.` root entry;
+the corrected check verifies that it is a root-owned `0755` directory before
+checking the `/usr` payload. Failed evidence was retained. VM credentials,
+checkpoints and raw logs are private, not release assets. These results do not
+establish an AUR listing, signed APT repository, mobile support or macOS support.
 
 ### Linux release and upgrade qualification
 
